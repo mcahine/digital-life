@@ -66,9 +66,14 @@ MAX_TOTAL_BYTES = 40 * 1024 * 1024
 #: 退避要能**跨出 rpm 的滚动窗口**，否则重试必然再撞同一堵墙。
 #: 实测（2026-10-23，40 并发）：tries=4 / max=20s（总 2+4+8+16=30s）时，
 #: 退避完仍是 429 "rpm exhausted" —— 因为 rpm 按 60s 滚动窗口计，30s 还在窗内。
-#: 改为 tries=5 / max=65s（2+4+8+16+65≈95s），单次退避足以跨窗。
-RATE_LIMIT_TRIES = int(os.environ.get("DL_RATE_LIMIT_TRIES") or 5)
-RATE_LIMIT_MAX_S = float(os.environ.get("DL_RATE_LIMIT_MAX_S") or 65.0)
+#:
+#: 但也不能无限加长：退避是**阻塞式 sleep，占着线程槽位不产出**。
+#: 40 并发下 19/23 的失败是 rpm 时，一半槽位在睡觉，净产出从 7.9 掉到 3.96 片/分。
+#: 折中：2 次退避（20s + 45s = 65s，刚好跨过一个 60s 窗），失败就交回 batch 层
+#: 靠 --rounds 下一轮重试（那时窗口早已过去，且不占槽位）。
+RATE_LIMIT_TRIES = int(os.environ.get("DL_RATE_LIMIT_TRIES") or 2)
+RATE_LIMIT_BASE_S = float(os.environ.get("DL_RATE_LIMIT_BASE_S") or 20.0)
+RATE_LIMIT_MAX_S = float(os.environ.get("DL_RATE_LIMIT_MAX_S") or 45.0)
 _RETRYABLE_CODES = frozenset({413, 429})
 
 MAX_TOKENS_CAP = 65536
@@ -309,7 +314,7 @@ class ChatClient:
                 last = exc
                 if attempt >= RATE_LIMIT_TRIES:
                     break
-                time.sleep(min(RATE_LIMIT_MAX_S, 2.0 * (2 ** attempt)))
+                time.sleep(min(RATE_LIMIT_MAX_S, RATE_LIMIT_BASE_S * (2 ** attempt)))
         raise last  # type: ignore[misc]
 
     def _post_once(self, payload: dict) -> dict:

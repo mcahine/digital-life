@@ -1117,8 +1117,14 @@ def main() -> int:
                 sends.append(len(calls))
 
         _s = []
-        _lm.RATE_LIMIT_MAX_S = 0.0        # 测试里不退避，只数次数
-        _drive(429, _s)
+        # 测试里不退避，只数次数。**必须还原**（S16）：T31g 要读真实退避时长，
+        # 被这里改成 0 会算出 total=0 而假红（本轮实测踩到）。
+        _saved_max = _lm.RATE_LIMIT_MAX_S
+        _lm.RATE_LIMIT_MAX_S = 0.0
+        try:
+            _drive(429, _s)
+        finally:
+            _lm.RATE_LIMIT_MAX_S = _saved_max
         check("T30c 429 会被重试（次数 = 1 + RATE_LIMIT_TRIES）",
               _s and _s[0] == _lm.RATE_LIMIT_TRIES + 1, str(_s))
 
@@ -1162,6 +1168,15 @@ def main() -> int:
         check("T31f 等待预算覆盖一个 5 小时窗（否则跑不完就得重来）",
               _bv.QUOTA_MAX_WAIT_H >= 5.0 and _bv.QUOTA_PAUSE_MIN > 0,
               "max_wait=%s pause=%s" % (_bv.QUOTA_MAX_WAIT_H, _bv.QUOTA_PAUSE_MIN))
+
+        # 退避是阻塞式 sleep，占着线程槽位不产出 —— 总时长必须「够跨一个 60s 窗」且「别太长」。
+        # 实测两端：95s（tries=5/max=65）→ 40 并发下一半槽位在睡觉，净产出掉到 3.96 片/分；
+        # 6s（基准错写成 2.0）→ 根本跨不出窗口，重试必再撞。
+        _seq = [min(_lm.RATE_LIMIT_MAX_S, _lm.RATE_LIMIT_BASE_S * (2 ** i))
+                for i in range(_lm.RATE_LIMIT_TRIES)]
+        _total = sum(_seq)
+        check("T31g 退避总时长跨得出 60s 窗口且不过长（60–100s）",
+              60.0 <= _total <= 100.0, "seq=%s total=%.0fs" % (_seq, _total))
     except Exception as _e:  # noqa: BLE001
         check("T31 额度看门狗", False, f"{type(_e).__name__}: {_e}")
 

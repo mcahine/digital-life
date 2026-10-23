@@ -10,7 +10,7 @@
 | 视觉总结（手机侧） | **5,940 / 5,940（100%）**，不合规 0、空总结 0、三段齐全 100% |
 | 视觉总结（PC 侧） | 3,735 片含图；已完成约 2,700，**剩余约 1,000**（在跑）|
 | ⚠️ PC 侧历史结果 | 1,879 条里 **1,874 条是"盲总结"**（一张图都没送到模型）；已修，需用 `--blind` 重做 |
-| 冒烟 | **166 / 0** |
+| 冒烟 | **167 / 0** |
 | 时段页 | 753 个 html 已全量重建（208.4 MB）|
 | 日报 | 753 篇（本轮重跑后需再验）|
 
@@ -20,7 +20,7 @@
 cd 01-Projects/digital-life
 export PYTHONUTF8=1
 DL_LLM_TIMEOUT=240 python scripts/batch_vision.py --all --device pc \
-    --reader model --workers 40 --rounds 12 --pause-min 10 --max-wait-h 6.5
+    --reader model --workers 32 --rounds 14 --pause-min 10 --max-wait-h 6.5
 ```
 
 日志：`tmp/v_pc_wd.log`。**额度看门狗已启用**：探针失败且判定为额度耗尽时，
@@ -31,7 +31,7 @@ DL_LLM_TIMEOUT=240 python scripts/batch_vision.py --all --device pc \
 ```bash
 # 1) 重做那 1,874 条盲总结（判据：_meta.images_sent=0 且 images_total>0）
 DL_LLM_TIMEOUT=240 python scripts/batch_vision.py --all --device pc \
-    --reader model --workers 40 --rounds 12 --blind
+    --reader model --workers 32 --rounds 14 --blind
 
 # 2) 重生成日报（--workers 4，753 天约 9 分钟）
 python scripts/rebuild_daily.py --workers 4
@@ -41,7 +41,7 @@ python scripts/build_slice_html.py --all --workers 6
 
 # 4) 发布 + 复核
 python -m digitallife.cli publish --no-zip
-python scripts/smoke.py            # 必须 166/0
+python scripts/smoke.py            # 必须 167/0
 python scripts/prune_results.py     # 不合规必须 0
 ```
 

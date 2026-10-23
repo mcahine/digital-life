@@ -146,7 +146,7 @@ cd 01-Projects/digital-life
 export PYTHONUTF8=1
 
 # 幂等：已有 slice_result 的片自动跳过，可随时中断续跑
-python scripts/batch_vision.py --all --device phone-2 --reader text --workers 40 --rounds 4
+python scripts/batch_vision.py --all --device phone-2 --reader text --workers 32 --rounds 14
 
 # 监控（完成/停滞/超时自动退出并写报告）
 python tmp/monitor.py --interval 180 --max-hours 10
