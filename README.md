@@ -34,7 +34,7 @@
 | 截图守恒 | phone-1 103,424 / pc-main 55,527，与源 `kind='screen'` 完全一致 |
 | 日总结 | **753** 天 |
 | 视觉结果 | `slice_result` **7,819 片**（其中 phone-2 侧 5,940 片，已 100% 完成）|
-| 主回归 | `scripts/smoke.py` **170 项** |
+| 主回归 | `scripts/smoke.py` **171 项** |
 
 ## 五个数据源
 
@@ -68,7 +68,7 @@ python -m digitallife.cli verify
 批量与清理：
 
 ```bash
-python scripts/smoke.py                                      # 170 项主回归
+python scripts/smoke.py                                      # 171 项主回归
 python scripts/batch_vision.py --all --workers 24 --rounds 8  # 批量视觉（须配 DL_LLM_TIMEOUT=240）
 python scripts/batch_vision.py --all --blind --workers 24     # 重做"没送图就写了总结"的历史片
 python scripts/rebuild_daily.py --workers 4                   # 重生成日报（753 天约 9 分钟）

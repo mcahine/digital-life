@@ -66,8 +66,8 @@ digitallife/
   publish.py      publish_all：产出 md / NDJSON / manifest / zip
   cli.py          子命令：ingest / dbview / slice / vision / ocr / daily / publish / verify
 scripts/
-  smoke.py            主回归套件（**170 项**，含构造性探查与注入验红哨兵）
-  batch_vision.py     并发批量视觉识别（--all/--days/--workers/--rounds；写后复核删不合格）；
+  smoke.py            主回归套件（**171 项**，含构造性探查与注入验红哨兵）
+  batch_vision.py     并发批量视觉识别（--all/--days/--workers/--rounds；写后复核**只上报不删行**）；
                       --blind 重做「有图但一张没送到模型」的历史盲总结（判据见 DL-10）
   prune_results.py    按 screenmemo-v1 约定清理不合规 slice_result（默认只报告）
   rebuild_daily.py    批量重生成日报（--workers 4 时 753 天约 9 分钟 / 0.73s 每天；
@@ -133,6 +133,13 @@ tmp/                  运行产物（.gitignore 已排除）——**中间文件
 2. **结构打回重做**：`schema_check` 判不合格 → 把**具体违规理由**回灌模型重做，最多 `REWORK_ROUNDS = 5` 轮。
    仍不合格 **照常写库**，只记 `_meta.schema_ok=False` + `_meta.schema_check`（用户裁决：
    有内容就入库，格式问题可事后 prune，不要为了格式丢掉唯一的一次读图结果）。
+
+   ⚠️ **`batch_vision` 不得"写后即删"**。它曾经在复核不合格时
+   `DELETE FROM slice_result`，与 `vision.enhance_slice` 的策略自相矛盾；
+   实测一次批量因此**丢了 37 片已经读到图的总结**（28 片缺字段、4 片某节要点不足、
+   4 片缺 `image_descriptions`），只能重烧一遍模型调用。
+   现在它只分类上报、行保留；**清理口径只有一个：`scripts/prune_results.py`**。
+   哨兵 T31k（断言 `run_one` 源码里不出现 `DELETE FROM slice_result`）。
 3. **并发**：模型侧可并发，但**有上限**。
 
    **2026-10-23 重测（参数已变：8 张图 / 长边 1280 / 起始 8192）**，结论与上表完全不同：
@@ -340,7 +347,7 @@ python -m digitallife.cli daily    --date 2026-08-13                # 日叙事
 python -m digitallife.cli publish  --no-zip                         # 产出 md + NDJSON + manifest
 python -m digitallife.cli verify                                    # 各源计数与跨度
 
-python scripts/smoke.py                                     # 170 项主回归
+python scripts/smoke.py                                     # 171 项主回归
 # 批量视觉：32 并发 + 超时 240 + 60s 退避是实测最优组合（净 5.7 片/分，见 D.2）
 DL_LLM_TIMEOUT=240 python scripts/batch_vision.py --all --workers 32 --rounds 14
 python scripts/rebuild_daily.py                             # 批量重生成日报
@@ -362,7 +369,7 @@ export DL_WORK_DIR="<ManicTime 解包目录>"
 
 ## §G 改完必须自己验的十件事
 
-1. `python scripts/smoke.py` → **必须 170/0**（不是"大概绿了"）。
+1. `python scripts/smoke.py` → **必须 171/0**（不是"大概绿了"）。
 2. 幂等：同一批数据跑两遍，`count_events` 不变。
 3. 截图守恒：叶子片 `SUM(image_count)` == 源 `kind='screen'` 事件数（逐设备对齐）。
 4. 结构合规：`python scripts/prune_results.py` → 不合规必须 0（注意：这只是报告口径，

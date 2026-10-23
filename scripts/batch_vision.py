@@ -80,7 +80,12 @@ def run_one(item: tuple[str, int], force: bool = False) -> tuple[str, int, bool,
     try:
         res = enhance_slice(con, sid, reader=_READER, force=force)
         con.commit()
-        # 复核：写进去的必须合格，不合格立刻删
+        # 复核结构，但**不删行**（用户裁决，见 AGENTS.md D.2）：
+        # 「有内容就入库，格式问题可事后 prune，不要为了格式丢掉唯一的一次读图结果」。
+        # 这里原先写后即 DELETE，与 vision.enhance_slice 的「照常写库 + 记 schema_ok=False」
+        # 自相矛盾 —— 实测有一次批量因此丢了 37 片已经读到图的总结（28 片缺字段、
+        # 4 片某节要点不足、4 片缺 image_descriptions），只能重烧一遍模型调用。
+        # 现在只分类上报，行保留；要清理跑 scripts/prune_results.py（它才是清理口径）。
         row = con.execute(
             "SELECT structured_json FROM slice_result WHERE slice_id = ?", (sid,)
         ).fetchone()
@@ -88,10 +93,10 @@ def run_one(item: tuple[str, int], force: bool = False) -> tuple[str, int, bool,
         st = _json.loads(row["structured_json"]) if row and row["structured_json"] else None
         v = validate_structured(st, require_images=False)
         if not v.ok:
-            con.execute("DELETE FROM slice_result WHERE slice_id = ?", (sid,))
-            con.commit()
-            return (sid, imgs, False, time.time() - t0,
-                    "written-then-rejected: " + "; ".join(e.message[:60] for e in v.errors[:2]))
+            return (sid, imgs, True, time.time() - t0,
+                    "sum=%d 保留但结构不合格(待 prune): %s"
+                    % (len(res.get("overall_summary") or ""),
+                       "; ".join(e.message[:50] for e in v.errors[:2])))
         return (sid, imgs, True, time.time() - t0,
                 "sum=%d rework=%s" % (len(res.get("overall_summary") or ""),
                                       res.get("rework_rounds")))

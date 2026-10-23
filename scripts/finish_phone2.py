@@ -134,8 +134,12 @@ def main() -> int:
         return 1
 
     for i, (desc, cmd) in enumerate([
-        ("重生成时段页", [sys.executable, "scripts/build_slice_html.py", "--all"]),
-        ("重生成日报", [sys.executable, "scripts/rebuild_daily.py"]),
+        # 必须带 --workers：两者都是纯 CPU 的渲染/归并，串行只用 1 核。
+        # 实测 753 页 15min → 6min、753 天日报 18min → 3.7min（见 AGENTS.md D.2）。
+        ("重生成时段页", [sys.executable, "scripts/build_slice_html.py", "--all",
+                     "--workers", "6"]),
+        ("重生成日报", [sys.executable, "scripts/rebuild_daily.py",
+                    "--workers", "4"]),
         ("发布到 vault", [sys.executable, "-m", "digitallife.cli", "publish", "--no-zip"]),
     ], start=2):
         print("\n步骤 %d/5 %s" % (i, desc), flush=True)

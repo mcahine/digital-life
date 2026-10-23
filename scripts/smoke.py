@@ -1205,6 +1205,17 @@ def main() -> int:
                   _vi.MAX_ASPECT_RATIO >= 8.0, str(_vi.MAX_ASPECT_RATIO))
         except ImportError:
             pass
+
+        # batch_vision 不得「写后即删」结构不合格的行。
+        # 用户裁决（见 D.2）：有内容就入库，格式问题事后 prune，
+        # 不要为了格式丢掉唯一的一次读图结果。
+        # 实测事故：一次批量因此丢了 37 片已读到图的总结，只能重烧模型调用。
+        # vision.enhance_slice 一直照裁决做（只记 schema_ok=False），batch_vision 却删行，
+        # 两个实现互相矛盾 —— 这里钉住 batch_vision 不再出现 DELETE。
+        import inspect as _insp2
+        _bsrc = _insp2.getsource(_bv.run_one)
+        check("T31k batch_vision 不删结构不合格的行（改由 prune_results 清理）",
+              "DELETE FROM slice_result" not in _bsrc, _bsrc[:60])
     except Exception as _e:  # noqa: BLE001
         check("T31 额度看门狗", False, f"{type(_e).__name__}: {_e}")
 
