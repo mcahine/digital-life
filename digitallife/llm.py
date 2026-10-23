@@ -28,6 +28,7 @@ import base64
 import json
 import mimetypes
 import os
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -52,6 +53,24 @@ MAX_TOTAL_BYTES = 40 * 1024 * 1024
 # content 为空但 reasoning 非空时的定级文案（测试按这个子串断言）
 #: 上游硬上限（实测 400 报错信息："should be in [1, 65536]"）。任何放大 max_tokens 的路径
 #: 都必须先被它钳制，否则会从「空内容」变成不可重试的 400。
+#: 429/413/5xx 的退避重试：次数与单次上限。这三种都不是「这一片有问题」，
+#: 重发通常就过；不重发等于把并发换来的产能又扔掉（见 DL-11）。
+#:
+#: 413 为什么也算可重试（2026-10-23 实测，反直觉）：报错文案是
+#: "inference request payload too large"，但同一片原样重发**时好时坏**——
+#: 同一 slice（8 张图、base64 仅 0.2MB、最长边 1280）连续 5 次全 413；
+#: 换 1 张、2 张却成功；再换回 4 张又成功（328s）。
+#: 请求体只有 0.1–0.5MB，远低于任何合理上限，**所以这不是体积问题**。
+#: 真因疑为上游按 (账号/模型/时刻) 做的并发配额判定，回同一个 413 文案。
+#: 保守做法：既压缩体积（已做：抽样 8 张 + 长边 1280），也允许退避重试。
+#: 退避要能**跨出 rpm 的滚动窗口**，否则重试必然再撞同一堵墙。
+#: 实测（2026-10-23，40 并发）：tries=4 / max=20s（总 2+4+8+16=30s）时，
+#: 退避完仍是 429 "rpm exhausted" —— 因为 rpm 按 60s 滚动窗口计，30s 还在窗内。
+#: 改为 tries=5 / max=65s（2+4+8+16+65≈95s），单次退避足以跨窗。
+RATE_LIMIT_TRIES = int(os.environ.get("DL_RATE_LIMIT_TRIES") or 5)
+RATE_LIMIT_MAX_S = float(os.environ.get("DL_RATE_LIMIT_MAX_S") or 65.0)
+_RETRYABLE_CODES = frozenset({413, 429})
+
 MAX_TOKENS_CAP = 65536
 
 THINKING_HINT = "thinking 吃光了 token，请增大 max_tokens 或确认 thinking.enabled=false"
@@ -76,6 +95,10 @@ LLM_CFG_JSON = paths.PROJECT.parent / "second-brain" / "config" / "llm.json"
 
 class LLMError(RuntimeError):
     """模型通道的任何失败（未配置 / 传输 / 非 200 / 空响应）都收敛到这里。"""
+
+
+class _Retryable(LLMError):
+    """可退避重试的上游错误（429 限流、5xx 服务端）。不对外暴露。"""
 
 
 class EmptyContentError(LLMError):
@@ -268,6 +291,28 @@ class ChatClient:
 
     # ── 传输层 ────────────────────────────────────────────────────────────
     def _post(self, payload: dict) -> dict:
+        """带限流退避的发送。
+
+        429 是「这一秒请求太多」，不是「这一片有问题」——退避几秒重发通常就过。
+        旧实现把它和其他错误一起归成 LLMError 直接抛，调用方只能整片判失败再等下一轮
+        （batch_vision 一轮要几分钟），40 并发时 18 次 429 就等于白扔 18 片产能。
+        见 DL-11：429 的处置是「等」，不是「放弃」。
+
+        可重试：429（限流）、413（上游容量判定，非体积问题，见常量注释）、5xx。
+        不可重试：400（sensitive image 等内容判定）、401（凭据）、其余 4xx —— 立即抛出。
+        """
+        last: Exception | None = None
+        for attempt in range(RATE_LIMIT_TRIES + 1):
+            try:
+                return self._post_once(payload)
+            except _Retryable as exc:
+                last = exc
+                if attempt >= RATE_LIMIT_TRIES:
+                    break
+                time.sleep(min(RATE_LIMIT_MAX_S, 2.0 * (2 ** attempt)))
+        raise last  # type: ignore[misc]
+
+    def _post_once(self, payload: dict) -> dict:
         if not self.url:
             raise LLMError("模型通道未配置（缺 base_url）｜ " + CONFIG_HINT)
         if not self.gateway and not self.cfg.api_key:
@@ -279,11 +324,12 @@ class ChatClient:
                 resp = c.post(self.url, json=payload, headers=self._headers())
                 if resp.status_code != 200:
                     body = resp.read().decode("utf-8", "replace")
-                    raise LLMError(
-                        "上游返回 %s（%s）：%s" % (
-                            resp.status_code, self.url, _error_text(body)[:300]
-                        )
+                    msg = "上游返回 %s（%s）：%s" % (
+                        resp.status_code, self.url, _error_text(body)[:300]
                     )
+                    if resp.status_code in _RETRYABLE_CODES or resp.status_code >= 500:
+                        raise _Retryable(msg)
+                    raise LLMError(msg)
                 return _parse_completion(resp.read().decode("utf-8", "replace"))
         except LLMError:
             raise

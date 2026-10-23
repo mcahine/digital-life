@@ -1078,6 +1078,64 @@ def main() -> int:
     except Exception as _e:  # noqa: BLE001
         check("T29 预算策略", False, f"{type(_e).__name__}: {_e}")
 
+    # ---------- T30 429 必须退避重试，不能整片判失败 ----------
+    # 实测（2026-10-23，40 并发）：100 片里 18 次 429 直接成了「整片 FAIL」。
+    # 429 是「这一秒太挤」，退避几秒重发通常就过；判整片失败等于白扔产能
+    # （batch_vision 一轮要几分钟）。见 DL-11：429 的处置是「等」。
+    # 同时必须保证：400 sensitive / 413 too large 这类**重发无意义**的错误不许重试。
+    try:
+        from digitallife import llm as _lm
+
+        check("T30a 有退避次数常量", _lm.RATE_LIMIT_TRIES >= 1, str(_lm.RATE_LIMIT_TRIES))
+        check("T30b _Retryable 是 LLMError 子类（上层 catch 兼容）",
+              issubclass(_lm._Retryable, _lm.LLMError))
+
+        class _FakeResp:
+            def __init__(self, code, body='{"error":"inference exceeds tpm/rpm limit"}'):
+                self.status_code = code
+                self._b = body.encode()
+
+            def read(self):
+                return self._b
+
+        def _drive(code, sends):
+            cfg = _lm.ChatConfig(base_url="https://x/v1/chat/completions", api_key="k",
+                                 model="m", timeout=1.0)
+            cli = _lm.ChatClient(cfg)
+            calls = []
+
+            def _fake_post(self_, url, json=None, headers=None):
+                calls.append(code)
+                return _FakeResp(code)
+
+            _lm.httpx.Client.post = _fake_post
+            try:
+                cli._post({"model": "m"})
+            except _lm.LLMError:
+                pass
+            finally:
+                sends.append(len(calls))
+
+        _s = []
+        _lm.RATE_LIMIT_MAX_S = 0.0        # 测试里不退避，只数次数
+        _drive(429, _s)
+        check("T30c 429 会被重试（次数 = 1 + RATE_LIMIT_TRIES）",
+              _s and _s[0] == _lm.RATE_LIMIT_TRIES + 1, str(_s))
+
+        # 413 反直觉地属于可重试（2026-10-23 实测）：同一片 8 图、0.2MB、长边 1280，
+        # 连续 5 次全 413；换 1 张、2 张成功；再换回 4 张也成功（328s）。
+        # 请求体远低于任何合理上限 → 不是体积问题，是上游按并发/时刻判的容量错。
+        _s2 = []
+        _drive(413, _s2)
+        check("T30d 413 也会退避重试（不是体积问题）",
+              _s2 == [_lm.RATE_LIMIT_TRIES + 1], str(_s2))
+
+        _s3 = []
+        _drive(400, _s3)
+        check("T30e 400（sensitive 一类）立即抛出、不重试", _s3 == [1], str(_s3))
+    except Exception as _e:  # noqa: BLE001
+        check("T30 限流退避", False, f"{type(_e).__name__}: {_e}")
+
     con.close()
     print(f"\n通过 {len(passed)} / 失败 {len(failed)}")
     if failed:
