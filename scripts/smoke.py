@@ -1037,6 +1037,47 @@ def main() -> int:
     except Exception as _e:  # noqa: BLE001
         check("T27 视觉图片送达", False, f"{type(_e).__name__}: {_e}")
 
+    # ---------- T28 送模型的图片张数必须打顶 ----------
+    # 实测（2026-10-23，同一片 18 图）：n=16 → 上游 400 "sensitive image"（2/2 次复现）；
+    # n=8 → 108s/68s 正常出 8185/5718 字；n=4 → 107s 且推理 8089 token。
+    # 即耗时由推理 token 决定、与张数无关，但张数决定会不会被上游判敏感。
+    try:
+        from digitallife.vision import MAX_SEND_IMAGES, _sample_evenly
+
+        check("T28a 单片送图张数有上限", 0 < MAX_SEND_IMAGES <= 12, str(MAX_SEND_IMAGES))
+        _arr = [{"n": i} for i in range(18)]
+        _kept, _drop = _sample_evenly(_arr, 8)
+        check("T28b 超限时抽样到上限", len(_kept) == 8 and _drop == 10,
+              "kept=%d drop=%d" % (len(_kept), _drop))
+        check("T28c 抽样保留首尾（最先与最后的画面都不能丢）",
+              _kept[0]["n"] == 0 and _kept[-1]["n"] == 17,
+              "%s..%s" % (_kept[0]["n"], _kept[-1]["n"]))
+        check("T28d 抽样结果无重复", len({k["n"] for k in _kept}) == len(_kept))
+        _small = [{"n": i} for i in range(5)]
+        _k2, _d2 = _sample_evenly(_small, 8)
+        check("T28e 未超限时原样返回", _k2 is _small and _d2 == 0)
+    except Exception as _e:  # noqa: BLE001
+        check("T28 送图上限", False, f"{type(_e).__name__}: {_e}")
+
+    # ---------- T29 起始 max_tokens 必须小，只在空内容时才放大 ----------
+    # 实测（2026-10-23，同一片 8 图，交替各 2 次）：
+    #   mt=65536 → 269.9s / 217.0s，推理 23,439 / 20,568 token
+    #   mt=8192  → 189.9s /  71.4s，推理  1,749 /  1,383 token
+    # 预算越大模型越展开长篇推理，耗时翻 3–4 倍，而输出字数并没有变多。
+    try:
+        from digitallife import vision as _v3
+
+        check("T29a 起始预算远低于硬上限",
+              _v3.MAX_TOKENS <= 16384 and _v3.MAX_TOKENS_CEILING == 65536,
+              "start=%s ceiling=%s" % (_v3.MAX_TOKENS, _v3.MAX_TOKENS_CEILING))
+        _seq = []
+        for _t in range(1, 8):
+            _seq.append(min(_v3.MAX_TOKENS_CEILING, _v3.MAX_TOKENS * (2 ** (_t - 1))))
+        check("T29b 放大序列单调且封顶于 65536",
+              _seq == sorted(_seq) and max(_seq) == 65536, str(_seq))
+    except Exception as _e:  # noqa: BLE001
+        check("T29 预算策略", False, f"{type(_e).__name__}: {_e}")
+
     con.close()
     print(f"\n通过 {len(passed)} / 失败 {len(failed)}")
     if failed:

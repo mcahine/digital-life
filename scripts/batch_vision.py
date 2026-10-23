@@ -30,10 +30,26 @@ _DEVICE = "pc"
 _READER = "model"
 
 
-def pick_pending(day: str | None, device: str = "pc") -> list[tuple[str, int]]:
+def pick_pending(day: str | None, device: str = "pc",
+                 blind: bool = False) -> list[tuple[str, int]]:
+    """选出要跑的片。blind=True 时改选"有图但一张没送到模型"的历史结果（重做它们）。
+
+    blind 的判据是 slice_result._meta 里的 images_sent=0 且 images_total>0 ——
+    这正是 2026-10-23 修掉的那个 bug 留下的痕迹（图在 zip 里，_chat 却传相对路径，
+    chat_images 读不到就静默跳过）。这类结果看着像看图的总结，其实全凭 DB 时间线。
+    """
     con = sqlite3.connect(paths.db_path())
     con.row_factory = sqlite3.Row
-    sql = """
+    if blind:
+        sql = """
+          SELECT s.slice_id, s.image_count FROM slice s
+          JOIN slice_result r ON r.slice_id = s.slice_id
+          WHERE s.device IN ({ph}) AND s.status != 'split' AND s.image_count > 0
+            AND json_extract(r.structured_json, '$._meta.images_total') > 0
+            AND COALESCE(json_extract(r.structured_json, '$._meta.images_sent'), 0) = 0
+        """
+    else:
+        sql = """
       SELECT s.slice_id, s.image_count FROM slice s
       WHERE s.device IN ({ph}) AND s.status != 'split' AND s.image_count > 0
         AND NOT EXISTS (SELECT 1 FROM slice_result r WHERE r.slice_id = s.slice_id)
@@ -51,13 +67,13 @@ def pick_pending(day: str | None, device: str = "pc") -> list[tuple[str, int]]:
     return out
 
 
-def run_one(item: tuple[str, int]) -> tuple[str, int, bool, float, str]:
+def run_one(item: tuple[str, int], force: bool = False) -> tuple[str, int, bool, float, str]:
     sid, imgs = item
     con = sqlite3.connect(paths.db_path(), check_same_thread=False)
     con.row_factory = sqlite3.Row
     t0 = time.time()
     try:
-        res = enhance_slice(con, sid, reader=_READER)
+        res = enhance_slice(con, sid, reader=_READER, force=force)
         con.commit()
         # 复核：写进去的必须合格，不合格立刻删
         row = con.execute(
@@ -90,6 +106,8 @@ def main() -> int:
     ap.add_argument("--device", default="pc")
     ap.add_argument("--reader", default="model",
                     choices=["model", "local", "both", "text"])
+    ap.add_argument("--blind", action="store_true",
+                    help="重做「有图但一张没送到模型」的历史结果（_meta.images_sent=0）")
     args = ap.parse_args()
     global _DEVICE, _READER
     _DEVICE = args.device
@@ -101,15 +119,15 @@ def main() -> int:
 
     for day in days:
         for rnd in range(1, args.rounds + 1):
-            ids = pick_pending(day, _DEVICE)
+            ids = pick_pending(day, _DEVICE, blind=args.blind)
             if not ids:
                 break
-            label = day or "ALL"
+            label = (day or "ALL") + (" [重做盲总结]" if args.blind else "")
             print("\n=== %s 第 %d 轮：待处理 %d 片，并发 %d ===" % (label, rnd, len(ids), args.workers),
                   flush=True)
             ok = fail = 0
             with ThreadPoolExecutor(max_workers=args.workers) as ex:
-                futs = {ex.submit(run_one, it): it for it in ids}
+                futs = {ex.submit(run_one, it, args.blind): it for it in ids}
                 for i, f in enumerate(as_completed(futs), 1):
                     sid, imgs, good, dt, info = f.result()
                     if good:

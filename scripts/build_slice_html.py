@@ -246,8 +246,6 @@ def main() -> int:
         print("未指定日期：用 --date YYYY-MM-DD 或 --all")
         con.close()
         return 2
-    con.close()          # 每个进程自己开连接，父进程的用不上了
-
     ok = 0
     total_bytes = 0
     if args.workers > 1 and len(days) > 1:
@@ -266,7 +264,7 @@ def main() -> int:
     else:
         for d in days:
             try:
-                res = build_day(con, d)
+                res = build_day(con, d)  # 串行路径复用父连接（并发路径每个进程自开）
                 ok += 1
                 total_bytes += res["bytes"]
                 print("  %s -> %s (%.1f KB, %d 个 section)" % (

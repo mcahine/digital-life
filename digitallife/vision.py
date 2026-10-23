@@ -36,7 +36,15 @@ from .prompts.segment import PROMPT_VERSION, build_prompt
 from .schema_check import validate_structured
 from .tz import utc_ms_to_local
 
-MAX_TOKENS = 65536          # 上游实测支持（200）；推理暴涨时不再被吃光
+#: 起始预算 8192，空内容时逐级放大到 MAX_TOKENS（65536 是上游硬上限）。
+#: 为什么不直接给 65536（2026-10-23 实测，同一片 8 图，交替各跑 2 次）：
+#:   max_tokens=65536 → 269.9s / 217.0s，推理 token 23,439 / 20,568
+#:   max_tokens=8192  → 189.9s /  71.4s，推理 token  1,749 /  1,383
+#: 预算越大，模型越倾向于展开长篇推理（上限成了"邀请"），耗时随之翻 3–4 倍。
+#: 小预算下输出并没有变短（8,888 / 10,182 字 vs 8,751 / 6,865 字），信息量不减。
+#: 给足上限只在"推理暴涨把预算吃光导致空内容"时才需要 —— 那时重试会把预算翻倍。
+MAX_TOKENS = int(os.environ.get("DL_START_TOKENS") or 8192)
+MAX_TOKENS_CEILING = 65536   # 空内容重试可放大到此；上游硬上限，不得越过
 REWORK_ROUNDS = 5           # 结构不合格时最多打回重做 5 次（共 6 次机会）
 
 MAX_IMAGE_BYTES = 3 * 1024 * 1024      # 单张内联上限（按 data URL 长度算）
@@ -215,6 +223,34 @@ def _resolve_image(ev: dict) -> Path | None:
 #: 不是 OCR 抄字（OCR 另有 local reader）。可用 DL_IMAGE_MAX_SIDE 覆盖，0 = 不缩。
 IMAGE_MAX_SIDE = int(os.environ.get("DL_IMAGE_MAX_SIDE") or 1280)
 IMAGE_QUALITY = int(os.environ.get("DL_IMAGE_QUALITY") or 72)
+
+#: 每片最多送这么多张图（均匀抽样，保留首尾）。实测依据（2026-10-23，同一片 18 图）：
+#:   n=16 → 上游 400 "sensitive image"（6.2s 硬失败，2/2 次复现）
+#:   n=8  → 108.4s / 68.4s，均正常出 8275 / 5718 字
+#:   n=4  → 107.4s，推理 8089 token（比 n=8 还多）
+#: 结论：**耗时由推理 token 决定，不由图片张数决定**（n=4 与 n=8 同为 107s）。
+#: 但张数决定「会不会被上游判敏感」和视觉 token 的基座，所以取 8 打顶：
+#: 15 分钟一片的画面变化有限，8 张均匀抽样足以支撑「在做什么」，DB 时间线仍是骨架。
+#: 24 张全送既慢又会撞 400，收益为负。
+MAX_SEND_IMAGES = int(os.environ.get("DL_MAX_SEND_IMAGES") or 8)
+
+
+def _sample_evenly(items: list, n: int) -> tuple[list, int]:
+    """均匀抽样 n 个，保留第一个和最后一个。返回 (抽样结果, 丢掉的数量)。"""
+    if n <= 0 or len(items) <= n:
+        return items, 0
+    if n == 1:
+        return [items[0]], len(items) - 1
+    step = (len(items) - 1) / float(n - 1)
+    picked = [items[int(round(i * step))] for i in range(n)]
+    seen: set[int] = set()
+    uniq: list = []
+    for it in picked:
+        k = id(it)
+        if k not in seen:
+            seen.add(k)
+            uniq.append(it)
+    return uniq, len(items) - len(uniq)
 
 
 def _downscale(raw: bytes) -> bytes:
@@ -546,6 +582,18 @@ def enhance_slice(con, slice_id: str, client=None, reader: str = "model",
     described = _collect_descriptions(events)
     now_ms = int(time.time() * 1000)
 
+    # 图片张数打顶：实测 16 张起会被上游判 sensitive image（400 硬失败），
+    # 而耗时由推理 token 决定、与张数无关（n=4 与 n=8 同为 ~107s）。
+    # 所以抽样纯粹是为了「不撞 400 + 省视觉 token」，不是为了让单条变快。
+    # 抽样后必须**重编 idx**：提示词里的「图 N」与 R8 覆盖校验都以 idx 为准，
+    # 不重编会让模型按 1..18 作答而提示词只列了 8 个。
+    sampled, dropped_by_cap = _sample_evenly(images, MAX_SEND_IMAGES)
+    if dropped_by_cap:
+        for new_idx, it in enumerate(sampled, 1):
+            it["idx"] = new_idx
+        stats["sampled_out"] = dropped_by_cap
+    images = sampled
+
     slice_meta = {
         "start": _hms(meta["start_utc_ms"]),
         "end": _hms(meta["end_utc_ms"]),
@@ -605,7 +653,8 @@ def enhance_slice(con, slice_id: str, client=None, reader: str = "model",
     _tries = 0
     while not str(resp.get("content") or "").strip() and _tries < 40:
         _tries += 1
-        _budget = min(MAX_TOKENS, 4096 * (1 + _tries))
+        # 起始 8192，每轮翻倍，封顶 65536 —— 小预算够用时就不必为大预算付推理时间的账。
+        _budget = min(MAX_TOKENS_CEILING, MAX_TOKENS * (2 ** (_tries - 1)))
         try:
             resp = _chat(client, full_prompt, send_images, _budget)
         except Exception:  # noqa: BLE001 —— 网络抖动也继续重试
@@ -640,9 +689,12 @@ def enhance_slice(con, slice_id: str, client=None, reader: str = "model",
     # 应用不得编造 DB 里没有的、有图时必须覆盖全部图片序号。
     # 不合格时把**具体的违规理由**回灌给模型重做；最多 REWORK_ROUNDS 轮，仍不合格则不写库并报错。
     db_apps = {(it.get("app") or "").strip() for it in baseline if (it.get("app") or "").strip()}
+    # image_count 必须等于**这次真的送出去（并在提示词里列过）**的张数。
+    # 旧写法用 stats["total"]（当日全部截图，含缺失/超限/被抽样掉的），
+    # 于是 R8 要求覆盖 18 张而提示词只列了 24 个已送项里的一部分 —— 天生不可满足。
     verdict = validate_structured(
         structured,
-        image_count=(len(described) if reader == "text" else stats["total"]),
+        image_count=(len(described) if reader == "text" else len(send_images)),
         db_apps=db_apps,
         require_images=bool(send_images),
     )
