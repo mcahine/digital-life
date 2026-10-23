@@ -1177,6 +1177,34 @@ def main() -> int:
         _total = sum(_seq)
         check("T31g 退避总时长跨得出 60s 窗口且不过长（60–100s）",
               60.0 <= _total <= 100.0, "seq=%s total=%.0fs" % (_seq, _total))
+
+        # --blind 的选片条件必须限定 reader='model'。
+        # 手机侧 5,940 条是 reader='text'（用 ScreenMemo 自带画面描述，**设计上不送图**），
+        # images_sent 天然为 0。不限定就会把它们全当"盲总结"重做，白烧 5,940 次调用。
+        # 实测分母：sent=0 且 total>0 共 7,814 条，其中 reader=model 只有 1,874 条。
+        import inspect as _insp
+        _src = _insp.getsource(_bv.pick_pending)
+        check("T31h --blind 选片限定 reader='model'（否则手机会被误重做）",
+              "reader') = 'model'" in _src or "reader\') = \'model\'" in _src, _src[:80])
+
+        # 退化图必须在前处理阶段滤掉（2026-10-23 实证）：
+        # 一张 1280×20 的畸形 webp **单独发送就必触发 413**，
+        # 而同片 6 张正常图一起发完全成功。这是上游对极端宽高比的解码拒绝，
+        # 复用了 "payload too large" 文案 —— 不是体积问题，也不是并发问题。
+        try:
+            from PIL import Image as _I2
+            checks_ = []
+            for _wh, _want in (((1280, 20), True), ((1280, 704), False),
+                               ((841, 508), False), ((1280, 100), True)):
+                _b = _io.BytesIO()
+                _I2.new("RGB", _wh).save(_b, "WEBP")
+                checks_.append((_wh, _vi._is_degenerate(_b.getvalue()), _want))
+            check("T31i 畸形图被识别、正常图不被误杀",
+                  all(got == want for _wh, got, want in checks_), str(checks_))
+            check("T31j 宽高比阈值足以放行 2:1 的真实截图",
+                  _vi.MAX_ASPECT_RATIO >= 8.0, str(_vi.MAX_ASPECT_RATIO))
+        except ImportError:
+            pass
     except Exception as _e:  # noqa: BLE001
         check("T31 额度看门狗", False, f"{type(_e).__name__}: {_e}")
 

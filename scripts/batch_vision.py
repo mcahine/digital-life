@@ -47,6 +47,11 @@ def pick_pending(day: str | None, device: str = "pc",
           WHERE s.device IN ({ph}) AND s.status != 'split' AND s.image_count > 0
             AND json_extract(r.structured_json, '$._meta.images_total') > 0
             AND COALESCE(json_extract(r.structured_json, '$._meta.images_sent'), 0) = 0
+            -- 必须限定 reader='model'：手机侧 5,940 条是 reader='text'（用 ScreenMemo 自带的
+            -- 画面描述，**设计上就不送图**），images_sent 天然为 0。不限定就会把它们
+            -- 全部当成"盲总结"重做一遍 —— 白白烧掉 5,940 次模型调用（实测分母：
+            -- sent=0 且 total>0 共 7,814 条，其中 reader=model 只有 1,874 条）。
+            AND json_extract(r.structured_json, '$._meta.reader') = 'model'
         """
     else:
         sql = """

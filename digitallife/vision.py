@@ -234,6 +234,31 @@ IMAGE_QUALITY = int(os.environ.get("DL_IMAGE_QUALITY") or 72)
 #: 24 张全送既慢又会撞 400，收益为负。
 MAX_SEND_IMAGES = int(os.environ.get("DL_MAX_SEND_IMAGES") or 8)
 
+#: 退化图过滤：宽高比超过这个值，或短边小于 MIN_SIDE_PX，就不送模型。
+#: 实测（2026-10-23）：一张 **1280×20** 的截图（ManicTime 偶发写入的畸形 webp，
+#: 宽 1280 高只剩 20 像素，比 64:1）**单独发送就必触发 413**
+#: "inference request payload too large" —— 而同一片的 6 张正常图（1280×704）
+#: 一起发完全成功（138s / 4481 字）。所以 413 既不是体积也不是并发，
+#: 而是**上游对极端宽高比的解码拒绝**，复用了 413 文案。
+#: 这类图本来也没有信息量（20 像素高的横条），滤掉不损失内容。
+MAX_ASPECT_RATIO = float(os.environ.get("DL_MAX_ASPECT") or 12.0)
+MIN_SIDE_PX = int(os.environ.get("DL_MIN_SIDE_PX") or 64)
+
+
+def _is_degenerate(raw: bytes) -> bool:
+    """疑似畸形截图：宽高比过极端或短边过小。缺 PIL 时一律当作正常（宁可发，不可误杀）。"""
+    try:
+        from PIL import Image
+    except ImportError:
+        return False
+    try:
+        w, h = Image.open(io.BytesIO(raw)).size
+    except Exception:  # noqa: BLE001
+        return False
+    if min(w, h) < MIN_SIDE_PX:
+        return True
+    return (max(w, h) / float(max(1, min(w, h)))) > MAX_ASPECT_RATIO
+
 
 def _sample_evenly(items: list, n: int) -> tuple[list, int]:
     """均匀抽样 n 个，保留第一个和最后一个。返回 (抽样结果, 丢掉的数量)。"""
@@ -362,7 +387,13 @@ def _collect_images(events: list[dict], meta: dict) -> tuple[list[dict], dict]:
             stats["missing"] += 1
             stats["missing_paths"].append(ev.get("path") or ev.get("event_id") or "?")
             continue
+        if _is_degenerate(raw):
+            stats["degenerate"] = stats.get("degenerate", 0) + 1
+            continue
         raw = _downscale(raw)
+        if _is_degenerate(raw):
+            stats["degenerate"] = stats.get("degenerate", 0) + 1
+            continue
         url = "data:" + _sniff_mime(raw) + ";base64," + base64.b64encode(raw).decode("ascii")
         if len(url) > MAX_IMAGE_BYTES:
             stats["oversize"] += 1

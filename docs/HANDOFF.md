@@ -10,7 +10,7 @@
 | 视觉总结（手机侧） | **5,940 / 5,940（100%）**，不合规 0、空总结 0、三段齐全 100% |
 | 视觉总结（PC 侧） | 3,735 片含图；已完成约 2,700，**剩余约 1,000**（在跑）|
 | ⚠️ PC 侧历史结果 | 1,879 条里 **1,874 条是"盲总结"**（一张图都没送到模型）；已修，需用 `--blind` 重做 |
-| 冒烟 | **167 / 0** |
+| 冒烟 | **170 / 0** |
 | 时段页 | 753 个 html 已全量重建（208.4 MB）|
 | 日报 | 753 篇（本轮重跑后需再验）|
 
@@ -41,7 +41,7 @@ python scripts/build_slice_html.py --all --workers 6
 
 # 4) 发布 + 复核
 python -m digitallife.cli publish --no-zip
-python scripts/smoke.py            # 必须 167/0
+python scripts/smoke.py            # 必须 170/0
 python scripts/prune_results.py     # 不合规必须 0
 ```
 
