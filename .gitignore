@@ -1,0 +1,26 @@
+# ---- 运行时产物（全部可重建，不入库）----
+tmp/
+verify.out
+
+# ---- 依赖与缓存 ----
+__pycache__/
+*.pyc
+.venv/
+.pytest_cache/
+*.egg-info/
+
+# ---- 库与数据（真源在 知识库/.data/digital-life/，本仓库只管代码）----
+*.sqlite
+*.sqlite3
+*.db
+*.ndjson
+*.zip
+
+# ---- 明文凭据 ----
+config/llm.json
+**/config/llm.json
+.env
+
+# ---- 编辑器/系统 ----
+.DS_Store
+Thumbs.db
