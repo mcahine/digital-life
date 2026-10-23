@@ -66,7 +66,7 @@ digitallife/
   publish.py      publish_all：产出 md / NDJSON / manifest / zip
   cli.py          子命令：ingest / dbview / slice / vision / ocr / daily / publish / verify
 scripts/
-  smoke.py            主回归套件（**160 项**，含构造性探查与注入验红哨兵）
+  smoke.py            主回归套件（**166 项**，含构造性探查与注入验红哨兵）
   batch_vision.py     并发批量视觉识别（--all/--days/--workers/--rounds；写后复核删不合格）；
                       --blind 重做「有图但一张没送到模型」的历史盲总结（判据见 DL-10）
   prune_results.py    按 screenmemo-v1 约定清理不合规 slice_result（默认只报告）
@@ -85,7 +85,7 @@ tmp/                  运行产物（.gitignore 已排除）——**中间文件
 
 ---
 
-## §C 动手前必读的十二条
+## §C 动手前必读的十三条
 
 | # | 规则 | 为什么（都是实测踩出来的）|
 |---|---|---|
@@ -101,6 +101,7 @@ tmp/                  运行产物（.gitignore 已排除）——**中间文件
 | **DL-10** | **跨层传递的中间结果必须有端到端哨兵**，不能靠每层自报成功 | vision 层「收集到 23 张，missing=0」+ llm 层「23 张缺失，已跳过」，两层日志各自正常，合起来是「一张图都没送」。PC 侧 1,874 条视觉总结因此全是**盲总结**（`_meta.images_sent=0`）。哨兵见冒烟 T27（断言 `_chat` 传的是 data URL 而非 zip 相对路径）|
 | **DL-11** | **上游报错必须按语义分三类处置**：可重试（`429` / `413` / `5xx`）、不可重试（`400 sensitive` / `401`）、需换抽样（`400` 的其他文案）。退避**必须跨过 rpm 的 60 秒滚动窗**，否则重试必然再撞同一堵墙 | 三条实测：①`429 rpm exhausted` 用 `tries=4 / max=20s`（共 30s）重试**全部再撞**，因为还在 60s 窗内；改 `tries=5 / max=65s` 后才有效。②`413` 文案写 `payload too large`，但实测**与体积无关**：同一片 8 图 / base64 仅 0.2MB / 长边 1280，连续 5 次全 413；换 1 张、2 张成功；再换回 4 张又成功（328s）。这是上游按并发判的容量错，也被归入可重试。③`400 sensitive image` 是内容判定，重发必错——实测 ≥16 张图必触发（2/2 复现），故送图打顶 8 张。哨兵见 T30a–e（含 413 可重试、400 不可重试两条反向断言）|
 | **DL-12** | **模型请求的 `max_tokens` 是"步长"不是"安全带"**：起始给够用的小预算，只在「空内容」时翻倍放大 | 交替各跑 2 次实测（同片 8 图）：`65536` → 269.9s/217.0s，推理 23,439/20,568 token；`8192` → 189.9s/**71.4s**，推理 1,749/1,383 token，输出字数反而更多（10,182 vs 6,865）。上限越宽模型越展开长推理，耗时差 3–4 倍。现为 `MAX_TOKENS=8192` 起、`MAX_TOKENS_CEILING=65536` 封顶（T29）|
+| **DL-13** | **额度不可读，只能探；且「限流」与「额度耗尽」必须分开处置** | 上游**不暴露额度**（2026-10-23 实测）：响应头无 `x-ratelimit-*`（`access-control-expose-headers` 只暴露三个文件传输头）；`/v1/usage`、`/v1/quota`、`/v1/rate_limit`、`/v1/me` **全 404**（`/v1/models` 200，证明路径没错）；bridge 的 `quota.remaining` 四通道全 `null`。因此只能用 8-token 探针间接判断。**关键陷阱**：429 正文的 `type` 一律是 `quota_exceeded_error`，但 `message` 才是真语义 —— `rpm exhausted` 是**每分钟限流**（等 90s 即恢复，停整批是浪费），无 rpm 字样才是**额度耗尽**（必须停下等刷新）。**按 `type` 分类必错**。实现见 `batch_vision._classify` + `wait_for_quota`，哨兵 T31a–f，详见 `docs/quota-and-ratelimit-2026-10-23.md` |
 
 ---
 
@@ -333,7 +334,7 @@ python -m digitallife.cli daily    --date 2026-08-13                # 日叙事
 python -m digitallife.cli publish  --no-zip                         # 产出 md + NDJSON + manifest
 python -m digitallife.cli verify                                    # 各源计数与跨度
 
-python scripts/smoke.py                                     # 160 项主回归
+python scripts/smoke.py                                     # 166 项主回归
 # 批量视觉：并发 40 + 超时 240 是实测最优组合（净 7.9 片/分，见 D.2）
 DL_LLM_TIMEOUT=240 python scripts/batch_vision.py --all --workers 40 --rounds 12
 python scripts/rebuild_daily.py                             # 批量重生成日报
@@ -355,7 +356,7 @@ export DL_WORK_DIR="<ManicTime 解包目录>"
 
 ## §G 改完必须自己验的十件事
 
-1. `python scripts/smoke.py` → **必须 160/0**（不是"大概绿了"）。
+1. `python scripts/smoke.py` → **必须 166/0**（不是"大概绿了"）。
 2. 幂等：同一批数据跑两遍，`count_events` 不变。
 3. 截图守恒：叶子片 `SUM(image_count)` == 源 `kind='screen'` 事件数（逐设备对齐）。
 4. 结构合规：`python scripts/prune_results.py` → 不合规必须 0（注意：这只是报告口径，

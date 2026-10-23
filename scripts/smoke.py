@@ -1136,6 +1136,35 @@ def main() -> int:
     except Exception as _e:  # noqa: BLE001
         check("T30 限流退避", False, f"{type(_e).__name__}: {_e}")
 
+    # ---------- T31 额度耗尽必须停下等，限流则不该停 ----------
+    # 上游**不暴露额度**（2026-10-23 实测）：响应头无 x-ratelimit-*；
+    # /v1/usage、/v1/quota、/v1/rate_limit、/v1/me 全 404；bridge 的 quota.remaining 全 null。
+    # 所以只能探针间接判断，而探针失败的**两种语义必须分开**：
+    #   rpm exhausted → 每分钟限流，等 90s 就恢复，停整批是浪费
+    #   额度耗尽      → 5 小时 / 周额度，必须暂停等刷新，硬跑只会一直 429
+    try:
+        import sys as _sys
+        _sys.path.insert(0, str(ROOT / "scripts"))
+        import batch_vision as _bv
+
+        check("T31a rpm 归为限流类",
+              _bv._classify("上游返回 429：rpm exhausted") == "rpm")
+        check("T31b 额度文案归为额度类",
+              _bv._classify("429 exceeded your current quota") == "quota"
+              and _bv._classify("insufficient balance") == "quota")
+        check("T31c 网络类既不限流也不额度",
+              _bv._classify("ReadTimeout") == "other")
+        check("T31d 两种提示词集合不重叠（分类不会打架）",
+              not (set(_bv._QUOTA_HINTS) & set(_bv._RPM_HINTS)))
+        # 用**真实日志里出现过的报错串**回归，不是我自己造的样例
+        check("T31e 真实 429 串分类正确（rpm exhausted 是限流，不是额度）",
+              _bv._classify('上游返回 429（https://token.sensenova.cn/v1/chat/completions）：rpm exhausted') == "rpm")
+        check("T31f 等待预算覆盖一个 5 小时窗（否则跑不完就得重来）",
+              _bv.QUOTA_MAX_WAIT_H >= 5.0 and _bv.QUOTA_PAUSE_MIN > 0,
+              "max_wait=%s pause=%s" % (_bv.QUOTA_MAX_WAIT_H, _bv.QUOTA_PAUSE_MIN))
+    except Exception as _e:  # noqa: BLE001
+        check("T31 额度看门狗", False, f"{type(_e).__name__}: {_e}")
+
     con.close()
     print(f"\n通过 {len(passed)} / 失败 {len(failed)}")
     if failed:
