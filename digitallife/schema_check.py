@@ -136,8 +136,12 @@ def validate_structured(structured: dict | None, *, image_count: int = 0,
                 # 把这条具体理由回灌模型重做 —— 这正是 schema_check 的设计用途。
                 n_bullet = len(re.findall(r"^\s*[-*+]\s+\S", body, re.M))
                 if n_bullet:
+                    # 回灌给模型的指令要可直接执行：光说「不要列表」它会把同一批句子
+                    # 原样搬成段落（每句一行）或继续加「- 」。必须点明「合并成一段」。
                     issues.append(Issue("R5b.summary_prose",
-                                        "「%s」里有 %d 个列表项；要求写成连贯叙述段落（日记体），不要用 - 或 * 列出"
+                                        "「%s」里有 %d 个列表项；要求写成连贯叙述段落（日记体）。"
+                                        "请把这一节的这些句子用逗号/句号连成一段连续的话，"
+                                        "删掉所有行首的 - 或 *，也不要每句单独占一行"
                                         % (h, n_bullet)))
 
     # R6 timeline 条目形状
