@@ -29,7 +29,9 @@ _TIMELINE_MIN_S = 120.0  # 日报只留单段 >=2 分钟的事件；碎片折叠
 _TIMELINE_LIMIT = 4000   # 兜底上限（正常远达不到）
 _TIMELINE_MIN_S = 120.0  # 日报只留单段 >=2 分钟的事件；碎片折叠，完整版进时段网页
 _SUMMARY_LIMIT = 400     # 视觉总结全量
-_KEY_ACTION_LIMIT = 30
+# 日报「关键操作」只留这么多条（R12：突出部分）。改小它的直接理由：
+# 2026-09-15 原先列了 248 条，一篇日报 27K 字，读起来是流水账不是日记。
+_KEY_ACTION_LIMIT = 10
 
 _DEFAULT_TOTALS = {"active_s": 0, "away_s": 0, "locked_s": 0}
 
@@ -716,9 +718,13 @@ def _actions_of(structured) -> list[str]:
     return out
 
 
-def _render_key_actions(slices_by_dev: dict[str, list[dict]]) -> list[str]:
+def _render_key_actions(slices_by_dev: dict[str, list[dict]],
+                        date_key: str = "") -> list[str]:
+    # 当日关键操作的摘要（不是全量流水账）。
+    # R12：日报只写突出部分，全量明细归时段网页。2026-10-24 之前这里把每片的每条
+    # action 都列出来 —— 2026-09-15 实测 248 条，日报沦为逐条时间戳的流水账。
     lines = ["## 关键操作", "",
-             "> 合并两设备各片的视觉结构化结果（按时间排序）；DB 时间线为基线（R3）。", ""]
+             "> 当日较突出的操作（全量见时段网页「视觉」区）；DB 时间线为基线（R3）。", ""]
     rows: list[tuple[int, str, str]] = []
     for dev in DEVICES:
         for s in slices_by_dev.get(dev, []):
@@ -738,7 +744,9 @@ def _render_key_actions(slices_by_dev: dict[str, list[dict]]) -> list[str]:
     for _, _, txt in rows[:_KEY_ACTION_LIMIT]:
         lines.append(f"- {txt}")
     if len(rows) > _KEY_ACTION_LIMIT:
-        lines.append(f"- 其余 {len(rows) - _KEY_ACTION_LIMIT} 条见 {_BT}10-时段/{_BT}")
+        _where = (f"{_BT}10-时段/{date_key}.html#vision{_BT}" if date_key
+                  else f"{_BT}10-时段/{_BT}")
+        lines.append(f"- 其余 {len(rows) - _KEY_ACTION_LIMIT} 条见 {_where}")
     return lines + [""]
 
 
@@ -855,11 +863,15 @@ def render_daily(date_key: str, breakdown: dict, structures: dict[str, dict],
     if not has_data:
         lines += ["## 电脑使用", "", "- （当日无数据）", "",
                   "## 手机使用", "", "- （当日无数据）", ""]
-        return "\n".join(lines + _render_key_actions(slices_by_dev)).rstrip("\n") + "\n"
+        return "\n".join(lines + _render_key_actions(slices_by_dev, date_key)).rstrip("\n") + "\n"
 
+    # include_summaries=False：2026-10-24 按 R12 收口。
+    # 旧版这里传 True，于是每片总结都变成一行「- 06:48-06:52 [电脑] …」；
+    # 2026-09-15 实测 248 条，日报沦为流水账。片层全文归时段网页。
     for dev in DEVICES:
-        lines += _render_device(dev, dd[dev], structures.get(dev) or {}, slices_by_dev.get(dev, []))
-    lines += _render_key_actions(slices_by_dev)
+        lines += _render_device(dev, dd[dev], structures.get(dev) or {},
+                                slices_by_dev.get(dev, []), include_summaries=False)
+    lines += _render_key_actions(slices_by_dev, date_key)
     return "\n".join(lines).rstrip("\n") + "\n"
 
 
@@ -941,7 +953,7 @@ def _llm_narrative(client, date_key: str, breakdown: dict,
 
 # ---------------------------------------------------------------- 主入口
 
-def build_daily(con, date_key: str, client=None) -> dict:
+def build_daily(con, date_key: str, client=None, persist: bool = True) -> dict:
     # 本模块内部大量使用 r["col"] 取值，隐含要求连接带 row_factory。
     # 外部脚本/测试用裸 sqlite3.connect() 调进来时会崩在 tuple 下标上，
     # 所以在入口统一兜住，不要求调用方记得设（2026-10-23 实测踩到）。
@@ -1039,17 +1051,33 @@ def build_daily(con, date_key: str, client=None) -> dict:
         "narrative": narrative,
     }
 
-    con.execute(
-        "INSERT INTO daily_summary(date_key, model, output_text, structured_json, "
-        "device_breakdown_json, created_at) VALUES(?,?,?,?,?,?) "
-        "ON CONFLICT(date_key) DO UPDATE SET model=excluded.model, "
-        "output_text=excluded.output_text, structured_json=excluded.structured_json, "
-        "device_breakdown_json=excluded.device_breakdown_json, created_at=excluded.created_at",
-        (date_key, model, output,
-         json.dumps(structured, ensure_ascii=False, sort_keys=True),
-         json.dumps(breakdown, ensure_ascii=False, sort_keys=True),
-         int(time.time() * 1000)),
-    )
+    # 只存"模型叙事原文"，不存渲染结果（2026-10-24 用户裁决：
+    # 「日报不需要存储到数据库…本身就是基于数据库内容进行的导出」）。
+    #   - narrative 是唯一不可重算的东西（要么调用模型，要么丢）
+    #   - output_text / structured / breakdown 全部可由 slice+event 现算
+    # persist=False（publish 走的路径）连 narrative 都不写，只把结果返回。
+    if persist:
+        _prev = con.execute(
+            "SELECT structured_json FROM daily_summary WHERE date_key = ?", (date_key,)
+        ).fetchone()
+        _keep = (narrative or "")
+        if not _keep and _prev:
+            try:
+                _keep = str((json.loads(_prev["structured_json"] or "{}")).get("narrative") or "")
+            except Exception:
+                _keep = ""
+        con.execute(
+            "INSERT INTO daily_summary(date_key, model, output_text, structured_json, "
+            "device_breakdown_json, created_at) VALUES(?,?,?,?,?,?) "
+            "ON CONFLICT(date_key) DO UPDATE SET model=excluded.model, "
+            "output_text=excluded.output_text, structured_json=excluded.structured_json, "
+            "device_breakdown_json=excluded.device_breakdown_json, created_at=excluded.created_at",
+            (date_key, model, output,
+             json.dumps({"_narrative_only": True, "narrative": _keep,
+                         "layer": LAYER, "date": date_key}, ensure_ascii=False),
+             json.dumps({}, ensure_ascii=False),
+             int(time.time() * 1000)),
+        )
 
     return {
         "date": date_key, "layer": LAYER, "output_text": output,

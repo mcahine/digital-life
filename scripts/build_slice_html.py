@@ -19,6 +19,8 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
+import json
 import sqlite3
 import sys
 from datetime import datetime
@@ -41,23 +43,74 @@ LAYERED_DIR = SLICE_ROOT / "片层"          # 片层 md 的新家（旧位置�
 _WEEK = ("星期一", "星期二", "星期三", "星期四", "星期五", "星期六", "星期日")
 
 
-def _day_devices(con: sqlite3.Connection, date_key: str) -> list[str]:
+# ---------------------------------------------------------------- 数据层缓存
+# 实测（2026-09-15）：取数据 3.17s，渲染只有 0.3s —— 瓶颈在 SQL 不在渲染。
+# 所以缓存必须坐在这一层：整个 (date_key) 的结构与片一次算好存 JSON，
+# 数据没变就直接读 JSON，跳过全部 SQL。
+# 指纹 = slice/slice_result/event 三张表的 (max(created_at), 行数)。
+_DATA_CACHE = Path(__file__).resolve().parents[1] / "tmp" / ".datacache"
+
+
+def _data_fp(con: sqlite3.Connection, date_key: str) -> str:
+    from slice_pages.contract import day_range_ms
+    lo, hi = day_range_ms(date_key)
+    h = hashlib.sha1()
+    for sql in (
+        "SELECT COUNT(*), COALESCE(MAX(created_at),0) FROM slice "
+        "WHERE start_utc_ms >= ? AND start_utc_ms < ?",
+        # created_at 两张表都有，join 后必须写全限定名，否则 ambiguous column。
+        "SELECT COUNT(*), COALESCE(MAX(r.created_at),0) FROM slice_result r "
+        "JOIN slice s ON s.slice_id=r.slice_id "
+        "WHERE s.start_utc_ms >= ? AND s.start_utc_ms < ?",
+        "SELECT COUNT(*), COALESCE(MAX(start_utc_ms),0) FROM event "
+        "WHERE start_utc_ms >= ? AND start_utc_ms < ?",
+    ):
+        row = con.execute(sql, (lo, hi)).fetchone()
+        h.update(repr(tuple(row)).encode())
+    return h.hexdigest()[:16]
+
+
+def _day_devices(con: sqlite3.Connection, date_key: str,
+                 structures: dict | None = None) -> list[str]:
     """当日有片或有视觉结果的设备（按注册表顺序，保证页面稳定）。"""
     found: list[str] = []
     # 遍历**注册表里的全部设备**，不能写死两台。旧写法只认 PC_DEVICE / PHONE_DEVICE，
     # 加第二部手机后 phone-2 整天被漏掉（2026-10-22）。
     from digitallife import devices as _dv
     for dev in [d.device_id for d in _dv.all_devices()]:
-        st = build_day_structure(con, date_key, dev)
+        # 复用已算好的结构：这里原先自己又调了一次 build_day_structure，
+        # 而 build_ctx 紧接着再调一次 —— 同一天同一设备白查两遍（实测占 ~1.3s）。
+        st = (structures or {}).get(dev) or build_day_structure(con, date_key, dev)
         if st and (st.get("timeline") or st.get("apps")):
             found.append(dev)
     return found
 
 
 def build_ctx(con: sqlite3.Connection, date_key: str) -> Ctx:
-    devices = _day_devices(con, date_key)
-    structures = {d: build_day_structure(con, date_key, d) for d in devices}
+    from digitallife import devices as _dv
+    fp = _data_fp(con, date_key)
+    cf = _DATA_CACHE / ("%s.json" % date_key)
+    if cf.exists():
+        try:
+            snap = json.loads(cf.read_text(encoding="utf-8"))
+            if snap.get("fp") == fp:
+                return Ctx(date_key=date_key, con=con, devices=snap["devices"],
+                           structures=snap["structures"], slices=snap["slices"])
+        except Exception:
+            pass
+
+    all_devs = [d.device_id for d in _dv.all_devices()]
+    structures = {d: build_day_structure(con, date_key, d) for d in all_devs}
+    devices = _day_devices(con, date_key, structures)
     slices = {d: load_slices(con, date_key, d) for d in devices}
+    try:
+        _DATA_CACHE.mkdir(parents=True, exist_ok=True)
+        cf.write_text(json.dumps({"fp": fp, "devices": devices,
+                                  "structures": {k: v for k, v in structures.items() if k in devices},
+                                  "slices": slices}, ensure_ascii=False),
+                      encoding="utf-8")
+    except Exception:
+        pass
     return Ctx(date_key=date_key, con=con, devices=devices,
                structures=structures, slices=slices)
 
@@ -128,6 +181,47 @@ def _section(anchor: str, title: str, count_text: str, body: str, seg_html: str 
             % (base.esc(anchor), base.esc(title), base.esc(count_text), seg_html, body))
 
 
+# ---------------------------------------------------------------- 片段缓存
+#
+# 为什么需要它（2026-10-24）：时段页是四个独立 section 拼出来的，但每次重建都
+# 把四段全部重算、整页重写。实测改完 3,650 片视觉总结后，我全量重建了 753 页 ——
+# 而实际只有 vision 那一段变了。timeline/apps/web 三段内容一个字节都没动。
+#
+# 做法：每段渲染完算 sha1；下一次若输入指纹没变就直接复用磁盘上的片段。
+# 缓存键 = (date_key, section_anchor)，值 = {fp, sha, html}。
+# 放在 tmp/.pagecache/ 下（tmp 已被 .gitignore 排除，不进版本库）。
+_CACHE_DIR = Path(__file__).resolve().parents[1] / "tmp" / ".pagecache"
+
+
+def _fp(*parts) -> str:
+    """算输入指纹。任何影响该段输出的东西都要传进来。"""
+    h = hashlib.sha1()
+    for p in parts:
+        h.update(repr(p).encode("utf-8", "replace"))
+    return h.hexdigest()[:16]
+
+
+def _cache_get(date_key: str, anchor: str, fp: str) -> tuple:
+    """返回 (片段 HTML 或 None, 行数)。指纹不符即视为未命中。"""
+    f = _CACHE_DIR / ("%s.%s.json" % (date_key, anchor))
+    if not f.exists():
+        return None, 0
+    try:
+        d = json.loads(f.read_text(encoding="utf-8"))
+    except Exception:
+        return None, 0
+    if d.get("fp") != fp:
+        return None, 0
+    return d["html"], int(d.get("n") or 0)
+
+
+def _cache_put(date_key: str, anchor: str, fp: str, html: str, n: int = 0) -> None:
+    _CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    f = _CACHE_DIR / ("%s.%s.json" % (date_key, anchor))
+    f.write_text(json.dumps({"fp": fp, "n": n, "html": html}, ensure_ascii=False),
+                 encoding="utf-8")
+
+
 def render_day(ctx: Ctx, counts: dict) -> tuple[str, list]:
     """返回 (整页 HTML, 目录条目)。目录只列实际渲染出内容的 section。"""
     body: list[str] = []
@@ -135,34 +229,77 @@ def render_day(ctx: Ctx, counts: dict) -> tuple[str, list]:
 
     # ---- 时间线
     if ctx.devices:
-        panels, opts, n = _device_panels(ctx, timeline)
-        if n:
-            body.append(_section(timeline.ANCHOR, timeline.LABEL, "{:,} 行".format(_max_of(opts)),
-                                 panels, base.seg("timeline", opts)))
-            toc.append((timeline.ANCHOR, timeline.LABEL, "{:,}".format(n)))
+        # 缓存命中时 count 也要恢复，否则目录条目会缺（片段里只有正文）。
+        _fp_tl = _fp("timeline", ctx.date_key, counts["events"], counts["web"],
+                     tuple(ctx.devices), ctx.date_key)
+        _hit, _hit_n = _cache_get(ctx.date_key, timeline.ANCHOR, _fp_tl)
+        if _hit is not None:
+            body.append(_hit)
+            if _hit_n:
+                toc.append((timeline.ANCHOR, timeline.LABEL, "{:,}".format(_hit_n)))
+        else:
+            panels, opts, n = _device_panels(ctx, timeline)
+            if n:
+                frag = _section(timeline.ANCHOR, timeline.LABEL,
+                                "{:,} 行".format(_max_of(opts)), panels,
+                                base.seg("timeline", opts))
+                body.append(frag)
+                toc.append((timeline.ANCHOR, timeline.LABEL, "{:,}".format(n)))
+                _cache_put(ctx.date_key, timeline.ANCHOR, _fp_tl, frag, n)
 
         # ---- 应用
-        panels, opts, n = _device_panels(ctx, apps)
-        if n:
-            # 计数用「各设备最大值」而不是合计：合计 59 会比单设备面板里的 28 更醒目，
-            # 但下面正文是逐设备的，两者并排就自相矛盾（用户 2026-10-22 截图即此）。
-            body.append(_section(apps.ANCHOR, apps.LABEL, "{:,} 个".format(_max_of(opts)),
-                                 panels, base.seg("apps", opts)))
-            toc.append((apps.ANCHOR, apps.LABEL, "{:,}".format(n)))
+        _fp_ap = _fp("apps", ctx.date_key, counts["events"], tuple(ctx.devices))
+        _hit, _hit_n = _cache_get(ctx.date_key, apps.ANCHOR, _fp_ap)
+        if _hit is not None:
+            body.append(_hit)
+            if _hit_n:
+                toc.append((apps.ANCHOR, apps.LABEL, "{:,}".format(_hit_n)))
+        else:
+            panels, opts, n = _device_panels(ctx, apps)
+            if n:
+                # 计数用「各设备最大值」而不是合计：合计 59 会比单设备面板里的 28 更醒目，
+                # 但下面正文是逐设备的，两者并排就自相矛盾（用户 2026-10-22 截图即此）。
+                frag = _section(apps.ANCHOR, apps.LABEL,
+                                "{:,} 个".format(_max_of(opts)), panels,
+                                base.seg("apps", opts))
+                body.append(frag)
+                toc.append((apps.ANCHOR, apps.LABEL, "{:,}".format(n)))
+                _cache_put(ctx.date_key, apps.ANCHOR, _fp_ap, frag, n)
 
         # ---- 网站
-        panels, opts, n = _device_panels(ctx, web)
-        if n:
-            body.append(_section(web.ANCHOR, web.LABEL, "{:,} 项".format(_max_of(opts)),
-                                 panels, base.seg("sites", opts)))
-            toc.append((web.ANCHOR, web.LABEL, "{:,}".format(n)))
+        _fp_wb = _fp("web", ctx.date_key, counts["web"], tuple(ctx.devices))
+        _hit, _hit_n = _cache_get(ctx.date_key, web.ANCHOR, _fp_wb)
+        if _hit is not None:
+            body.append(_hit)
+            if _hit_n:
+                toc.append((web.ANCHOR, web.LABEL, "{:,}".format(_hit_n)))
+        else:
+            panels, opts, n = _device_panels(ctx, web)
+            if n:
+                frag = _section(web.ANCHOR, web.LABEL,
+                                "{:,} 项".format(_max_of(opts)), panels,
+                                base.seg("sites", opts))
+                body.append(frag)
+                toc.append((web.ANCHOR, web.LABEL, "{:,}".format(n)))
+                _cache_put(ctx.date_key, web.ANCHOR, _fp_wb, frag, n)
 
     # ---- 视觉（跨设备，不分 panel）
-    vhtml, vtotal, vdone = vision.panel(ctx)
-    if vtotal:
-        body.append(_section(vision.ANCHOR, vision.LABEL,
-                             "%d 片 · %d 片已生成" % (vtotal, vdone), vhtml))
-        toc.append((vision.ANCHOR, vision.LABEL, "{:,}".format(vtotal)))
+    # 指纹用「已生成片数 + 当天片数」：视觉段的唯一输入就是 slice_result，
+    # 这两个数一变就说明有片被重写/新增，必须重算；没变则整段复用。
+    _fp_vi = _fp("vision", ctx.date_key, counts["slices"], counts["slices_done"])
+    _hit, _hit_n = _cache_get(ctx.date_key, vision.ANCHOR, _fp_vi)
+    if _hit is not None:
+        body.append(_hit)
+        if _hit_n:
+            toc.append((vision.ANCHOR, vision.LABEL, "{:,}".format(_hit_n)))
+    else:
+        vhtml, vtotal, vdone = vision.panel(ctx)
+        if vtotal:
+            frag = _section(vision.ANCHOR, vision.LABEL,
+                            "%d 片 · %d 片已生成" % (vtotal, vdone), vhtml)
+            body.append(frag)
+            toc.append((vision.ANCHOR, vision.LABEL, "{:,}".format(vtotal)))
+            _cache_put(ctx.date_key, vision.ANCHOR, _fp_vi, frag, vtotal)
 
     weekday = _WEEK[datetime.strptime(ctx.date_key, "%Y-%m-%d").weekday()]
     stats = ('<p class="stats">'

@@ -45,6 +45,9 @@ def _one(day: str) -> tuple[str, bool, str]:
 
 def main() -> int:
     ap = argparse.ArgumentParser()
+    ap.add_argument("--days", nargs="*", default=None,
+                    help="只重建这些日期（YYYY-MM-DD）。省略 = 全量。"
+                         "改了几天的片层就只重建那几天，不要每次全量 753 天。")
     ap.add_argument("--limit", type=int, default=0)
     ap.add_argument("--workers", type=int, default=1,
                     help="并发进程数；1 = 串行。实测 4 进程约 2 倍")
@@ -52,8 +55,12 @@ def main() -> int:
 
     con = sqlite3.connect(paths.db_path())
     con.row_factory = sqlite3.Row
-    days = [r["date_key"] for r in con.execute(
-        "SELECT date_key FROM daily_summary ORDER BY date_key")]
+    if args.days:
+        # 指定日期：不查 daily_summary（那天可能还没建过），直接用传入的清单。
+        days = list(args.days)
+    else:
+        days = [r["date_key"] for r in con.execute(
+            "SELECT date_key FROM daily_summary ORDER BY date_key")]
     con.close()
     if args.limit:
         days = days[: args.limit]

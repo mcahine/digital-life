@@ -1266,6 +1266,30 @@ def main() -> int:
         _msrc = _insp2.getsource(_bvm.main)
         check("T34f --force 真的透传到 enhance_slice（不是只选片不重做）",
               "args.blind or args.force" in _msrc, _msrc[-80:])
+
+        # 日报不入库（2026-10-24 用户裁决）：
+        #   「日报不需要存储到数据库，包括时段也是，本身就是基于数据库内容进行的导出」
+        # 于是 publish 必须**现算**，不能读库里的历史快照——否则改了渲染代码
+        # 忘了重跑，就会把旧正文搬进 vault（这正是 AGENTS.md §G.10 记的老坑）。
+        from digitallife import publish as _pub
+        _psrc = _insp2.getsource(_pub)
+        # 断言必须覆盖**调用点**而不只是 _daily_text 的函数体：
+        # 第一版只查函数体，注入「调用点改回读库」时仍然全绿（S20 白做）。
+        _body = _psrc.split("def _daily_text")[1].split("def ")[0]
+        _call = _psrc.split("row = _daily_row")[0]
+        check("T35a publish 日报走现算（调 build_daily），不再读库里的 output_text",
+              "persist=False" in _body
+              and "FROM daily_summary WHERE date_key" not in _body
+              and "text = _daily_text(con, day)" in _psrc,
+              "函数体或调用点不符")
+        check("T35b build_daily 支持 persist=False（发布路径不写库）",
+              "persist: bool = True" in _insp2.getsource(_daily.build_daily), "")
+        # 缓存层：数据层指纹必须用全限定列名（join 后 created_at 会重名，
+        # 实测直接抛 ambiguous column name: created_at，建页 rc=1 空转 0.4s）。
+        import scripts.build_slice_html as _sd  # noqa: E402
+        _bsrc2 = _insp2.getsource(_sd)
+        check("T35c 数据层缓存指纹用 r.created_at（避免 ambiguous column）",
+              "MAX(r.created_at)" in _bsrc2, "")
     except Exception as _e:  # noqa: BLE001
         check("T31 额度看门狗", False, f"{type(_e).__name__}: {_e}")
 

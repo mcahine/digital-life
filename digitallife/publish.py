@@ -332,20 +332,21 @@ def _render_slice_md(sl: dict, timeline: list[dict], basis: str) -> str:
 
 # ---------------------------------------------------------------- 日报
 
-def _daily_row(con, day: str) -> dict:
-    row = con.execute(
-        "SELECT date_key, model, output_text, structured_json, device_breakdown_json, created_at "
-        "FROM daily_summary WHERE date_key=?", (day,),
-    ).fetchone()
-    if row is None or not (row["output_text"] or "").strip():
-        from .daily import build_daily
+def _daily_text(con, day: str) -> str:
+    """当日日报正文 —— **现算，不读库**（2026-10-24 用户裁决）。
 
-        build_daily(con, day)
-        row = con.execute(
-            "SELECT date_key, model, output_text, structured_json, device_breakdown_json, created_at "
-            "FROM daily_summary WHERE date_key=?", (day,),
-        ).fetchone()
-    return dict(row) if row is not None else {}
+    用户原话：「日报不需要存储到数据库，包括时段也是，本身就是基于数据库内容
+    进行的导出」。
+
+    所以日报正文的唯一来源是 render_narrative/render_daily 的即时输出；
+    daily_summary 只留模型叙事原文（唯一不可重算的东西），不存渲染结果。
+    这也顺带消除一个长期隐患：库里的 output_text 是历史快照，改了渲染代码
+    却忘了重跑时，publish 会把旧正文搬进 vault（AGENTS.md §G.10）。
+    """
+    from .daily import build_daily
+
+    res = build_daily(con, day, persist=False)
+    return str((res or {}).get("output_text") or "").strip()
 
 
 # ---------------------------------------------------------------- 主入口
@@ -412,8 +413,7 @@ def publish_all(con, day_keys: list[str] | None = None, make_zip: bool = True) -
 
     # 2) 20-日报/YYYY-MM-DD.md —— 机器总结，frontmatter 仅 date 与 source
     for day in days:
-        row = _daily_row(con, day)
-        text = (row.get("output_text") or "").strip()
+        text = _daily_text(con, day)
         if not text:
             continue
         data = (text + "\n").encode("utf-8")
@@ -429,7 +429,9 @@ def publish_all(con, day_keys: list[str] | None = None, make_zip: bool = True) -
         "event": con.execute("SELECT COUNT(*) FROM event").fetchone()[0],
         "slice": con.execute("SELECT COUNT(*) FROM slice").fetchone()[0],
         "slice_result": con.execute("SELECT COUNT(*) FROM slice_result").fetchone()[0],
-        "daily": con.execute("SELECT COUNT(*) FROM daily_summary").fetchone()[0],
+        # 日报数 = 实际落盘的文件数，不是 daily_summary 行数。
+        # 日报已改为「不存渲染结果」，库里行数不再代表产出规模。
+        "daily": daily_written,
         "ndjson_rows": nd["rows"],
     }
     sources = []
