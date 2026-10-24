@@ -30,8 +30,13 @@ _DEVICE = "pc"
 _READER = "model"
 
 
+#: --force 的幂等水位线。进程启动时定格为「现在」，
+#: 于是只重做**本次启动之前**产出的结果；本次跑出来的行一定新于它，下一轮不会再被选中。
+_FORCE_BEFORE = int(time.time() * 1000)
+
+
 def pick_pending(day: str | None, device: str = "pc",
-                 blind: bool = False) -> list[tuple[str, int]]:
+                 blind: bool = False, force: bool = False) -> list[tuple[str, int]]:
     """选出要跑的片。blind=True 时改选"有图但一张没送到模型"的历史结果（重做它们）。
 
     blind 的判据是 slice_result._meta 里的 images_sent=0 且 images_total>0 ——
@@ -53,6 +58,16 @@ def pick_pending(day: str | None, device: str = "pc",
             -- sent=0 且 total>0 共 7,814 条，其中 reader=model 只有 1,874 条）。
             AND json_extract(r.structured_json, '$._meta.reader') = 'model'
         """
+    elif force:
+        # 改了提示词/格式之后要全量重做：此时「已有结果」不等于「已是新格式」。
+        # 幂等判据换成 created_at 时间戳 —— 只重做在 _FORCE_BEFORE 之前产出的行。
+        # **不能直接全选**：多轮循环里每轮都会把上一轮刚做完的片又选进来，永远跑不完。
+        sql = """
+      SELECT s.slice_id, s.image_count FROM slice s
+      LEFT JOIN slice_result r ON r.slice_id = s.slice_id
+      WHERE s.device IN ({ph}) AND s.status != 'split' AND s.image_count > 0
+        AND (r.slice_id IS NULL OR r.created_at < ?)
+    """
     else:
         sql = """
       SELECT s.slice_id, s.image_count FROM slice s
@@ -63,6 +78,8 @@ def pick_pending(day: str | None, device: str = "pc",
     _aliases = _dv.query_aliases(device)
     sql = sql.replace('{ph}', ','.join('?' * len(_aliases)))
     args: list = list(_aliases)
+    if force:
+        args.append(_FORCE_BEFORE)
     if day:
         sql += " AND date(s.start_utc_ms/1000,'unixepoch','+8 hours') = ?"
         args.append(day)
@@ -199,6 +216,9 @@ def main() -> int:
                          % QUOTA_MAX_WAIT_H)
     ap.add_argument("--no-watchdog", action="store_true",
                     help="关闭额度看门狗（默认开启）")
+    ap.add_argument("--force", action="store_true",
+                    help="重做已有结果的片（改了提示词/格式后全量重跑时用；"
+                         "不带它时只挑「还没有 slice_result」的片）")
     args = ap.parse_args()
     global _DEVICE, _READER
     _DEVICE = args.device
@@ -210,7 +230,7 @@ def main() -> int:
 
     for day in days:
         for rnd in range(1, args.rounds + 1):
-            ids = pick_pending(day, _DEVICE, blind=args.blind)
+            ids = pick_pending(day, _DEVICE, blind=args.blind, force=args.force)
             if not ids:
                 break
             if not args.no_watchdog and not wait_for_quota(args.pause_min, args.max_wait_h):
@@ -222,7 +242,11 @@ def main() -> int:
                   flush=True)
             ok = fail = quota_fail = 0
             with ThreadPoolExecutor(max_workers=args.workers) as ex:
-                futs = {ex.submit(run_one, it, args.blind): it for it in ids}
+                # run_one 的第二个参数是 force（透传给 enhance_slice），不是 blind。
+                # 曾经这里传的是 args.blind：于是 --blind 模式顺手开了 force（正确），
+                # 但新加的 --force 完全没生效 —— 3735 片 0.1s 就"跑完"，其实是
+                # 命中已有结果直接返回，sum=0。两个语义必须分开传。
+                futs = {ex.submit(run_one, it, args.blind or args.force): it for it in ids}
                 for i, f in enumerate(as_completed(futs), 1):
                     sid, imgs, good, dt, info = f.result()
                     if good:

@@ -432,11 +432,15 @@ def main() -> int:
             "timeline": [{"start": "09:00:00", "end": "10:00:00", "app": "Obsidian", "title": "笔记"}],
             "key_actions": [{"range": "09:00:00-10:00:00", "action": "写作", "detail": "写日报"}],
             "described_images": [], "image_tags": [], "image_descriptions": [],
+            # 日记体（2026-10-24）：每节是连贯叙述段落，不带时间戳前缀、不用列表。
+            # 旧样例是「- 09:00:00-10:00:00：…」清单，改造后它本身就不该算合格。
             "overall_summary": (
-                "## 关键操作\n- 09:00:00-10:00:00：打开 Obsidian 写日报\n"
-                "- 09:30:00：切到 Chrome 查资料\n- 09:50:00：回到编辑器\n\n"
-                "## 主要活动\n- 撰写日报正文\n- 查阅数据结构文档\n- 整理结构化字段\n\n"
-                "## 重点内容\n- 正文约 700 字\n- 引用真实应用名\n- 关键词覆盖充分\n"),
+                "## 关键操作\n先在 Obsidian 里打开当天要写的日报草稿，"
+                "写到一半切到 Chrome 查了一会儿资料，随后又回到编辑器接着写。\n\n"
+                "## 主要活动\n时间基本都花在撰写日报正文上，"
+                "查资料和整理结构化字段只占了零头。\n\n"
+                "## 重点内容\n正文最终写到约七百字，"
+                "应用名一律引用真实名称，关键词覆盖也比较充分。\n"),
         }
         check("T13 合格样例通过校验", _vs(good).ok is True)
         bad_cases = [
@@ -1216,6 +1220,52 @@ def main() -> int:
         _bsrc = _insp2.getsource(_bv.run_one)
         check("T31k batch_vision 不删结构不合格的行（改由 prune_results 清理）",
               "DELETE FROM slice_result" not in _bsrc, _bsrc[:60])
+
+        # 片层必须是日记体叙述，不能退回清单（2026-10-24 用户要求）。
+        # 实测只靠提示词约束不住（3 片里 1 片仍输出「- 」清单），所以校验层必须拦住，
+        # 否则 rework 循环没有机会纠正，坏格式直接入库。
+        from digitallife.schema_check import validate_structured as _vs
+        _prose = ("## 关键操作\n先打开页面逐个查看插件状态，接着回到对话区把会话重命名。"
+                  "随后切到面板看配额，最后回来核对代码改动。\n"
+                  "## 主要活动\n精力集中在对上下文系统的分析上，占了大半时间，"
+                  "剩下零星花在查配额和读文章上。\n"
+                  "## 重点内容\n围绕三个模块怎么合并成统一插件展开，"
+                  "已经清理两个文件并把配置迁到新位置。")
+        _bullets = ("## 关键操作\n- 打开页面查看插件\n- 回到对话区重命名会话\n- 切到面板看配额\n"
+                    "## 主要活动\n- 上下文系统分析占大半时间\n- 查配额与读文章占少量\n"
+                    "## 重点内容\n- 三模块合并成统一插件\n- 清理两个文件并迁配置\n")
+        _vp = _vs({"overall_summary": _prose}, require_images=False)
+        _vb = _vs({"overall_summary": _bullets}, require_images=False)
+        check("T34a 叙述体通过 R5b（不被误判成清单）",
+              not any(i.rule == "R5b.summary_prose" for i in _vp.errors),
+              str([i.rule for i in _vp.errors][:3]))
+        check("T34b 清单体被 R5b 拦下（提示词约束不住时靠校验兜底）",
+              any(i.rule == "R5b.summary_prose" for i in _vb.errors),
+              str([i.rule for i in _vb.errors][:3]))
+
+        # 日报不得回退成「逐片粘贴」（R12）。2026-10-24 之前 751/753 篇都带
+        # 「## 视觉总结」+ 每片原文，2026-08-13.md 达 1,477 行 / 138 KB。
+        import inspect as _insp3
+        from digitallife import daily as _daily
+        _rsrc = _insp3.getsource(_daily.render_narrative)
+        check("T34c render_narrative 不再逐片粘贴视觉总结（R12）",
+              "## 视觉总结" not in _rsrc, _rsrc[:60])
+        check("T34d 日报仍给出全量入口（展开看全量）",
+              "展开看全量" in _rsrc, _rsrc[:60])
+
+        # --force 的幂等水位线：必须只选「本次启动之前」产出的行。
+        # 若直接全选，多轮循环里每轮都会把上一轮刚做完的片重新选中，永远跑不完
+        # （改了提示词后要全量重做时正是这个场景）。
+        import scripts.batch_vision as _bvm  # noqa: E402
+        check("T34e --force 用启动水位线做幂等（不是全选）",
+              "_FORCE_BEFORE" in _insp2.getsource(_bvm.pick_pending),
+              _insp2.getsource(_bvm.pick_pending)[:60])
+        # --force 必须真的传到 enhance_slice。曾经 submit 里传的是 args.blind，
+        # 于是 --force 形同虚设：全量重做 3735 片 0.1 秒就"跑完"，其实命中已有结果
+        # 直接返回（sum=0），模型一次都没调 —— 静默零产出，最难发现的一类 bug。
+        _msrc = _insp2.getsource(_bvm.main)
+        check("T34f --force 真的透传到 enhance_slice（不是只选片不重做）",
+              "args.blind or args.force" in _msrc, _msrc[-80:])
     except Exception as _e:  # noqa: BLE001
         check("T31 额度看门狗", False, f"{type(_e).__name__}: {_e}")
 

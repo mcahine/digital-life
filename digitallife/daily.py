@@ -803,37 +803,19 @@ def render_narrative(date_key: str, breakdown: dict, structures: dict,
         out += _render_device(dev, v, structures.get(dev) or {},
                               slices_by_dev.get(dev, []), include_summaries=False)
 
-    # ---- 视觉总结：全部片层的完整总结，独立成章（每个片元一条，不截断）
+    # ---- 这里不再粘贴逐片总结（2026-10-24 按 R12 修正，见下方说明）
     all_sl: list[tuple[str, dict]] = []
     for dev in DEVICES:
         for s in slices_by_dev.get(dev, []):
             all_sl.append((dev, s))
     all_sl.sort(key=lambda p: (str(p[1].get("start") or ""), p[0]))
-    withsum = [(d, s) for d, s in all_sl if (s.get("overall_summary") or "").strip()]
-    if withsum:
-        out += ["## 视觉总结", "",
-                "> 每个时间片由视觉模型读图后写的完整总结（不截断）。"
-                "共 %d 片有总结 / %d 片。" % (len(withsum), len(all_sl)), ""]
-        multi = len({d for d, _ in all_sl}) > 1
-        for dev, s in withsum:
-            head = "%s-%s" % (s.get("start") or "", s.get("end") or "")
-            if multi:
-                head = "[%s] %s" % (_label(dev), head)
-            out.append("**%s**" % head)   # 加粗而非标题：不占用文档层级
-            out.append("")
-            # 这里**不能**用 _strip_heads：它会把「## 关键操作 / - 条目」压成一整段，
-            # 三条要点之间连分隔都没有，读起来像一坨。保持片层原有的三节 + 列表结构。
-            out += _summary_blocks(s.get("overall_summary") or "")
-    elif all_sl:
-        out += ["## 视觉总结", "",
-                "- 这一天共 %d 个时段，但都还没有视觉总结（可用 "
-                "%s脚本补跑后重新生成本页）。" % (
-                    len(all_sl), _BT + "python scripts/batch_vision.py --days "
-                    + date_key + _BT), ""]
-
-    if not all_sl:
-        out += ["## 视觉总结", "",
-                "- 这一天没有截图，因此没有画面级描述；以上内容全部来自应用与网页记录。", ""]
+    n_with = sum(1 for _d, s in all_sl if (s.get("overall_summary") or "").strip())
+    if all_sl:
+        note = "本日共 %d 个时段、%d 片有画面级总结；逐片全文见时段网页%s。" % (
+            len(all_sl), n_with, _BT + "10-时段/%s.html#vision" % date_key + _BT)
+    else:
+        note = "本日没有截图，以上内容全部来自应用与网页记录。"
+    out += ["## 展开看全量", "", "- " + note, ""]
 
     total_sums = sum(v["summary_count"] for v in dd.values())
     out += ["---", "",
