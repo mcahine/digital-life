@@ -34,7 +34,7 @@
 | 截图守恒 | phone-1 103,424 / pc-main 55,527，与源 `kind='screen'` 完全一致 |
 | 日总结 | **753** 天 |
 | 视觉结果 | `slice_result` **7,819 片**（其中 phone-2 侧 5,940 片，已 100% 完成）|
-| 主回归 | `scripts/smoke.py` **171 项** |
+| 主回归 | `scripts/smoke.py` **181 项** |
 
 ## 五个数据源
 
@@ -68,7 +68,7 @@ python -m digitallife.cli verify
 批量与清理：
 
 ```bash
-python scripts/smoke.py                                      # 171 项主回归
+python scripts/smoke.py                                      # 181 项主回归
 python scripts/batch_vision.py --all --workers 24 --rounds 8  # 批量视觉（须配 DL_LLM_TIMEOUT=240）
 python scripts/batch_vision.py --all --blind --workers 24     # 重做"没送图就写了总结"的历史片
 python scripts/rebuild_daily.py --workers 4                   # 重生成日报（753 天约 9 分钟）
@@ -116,18 +116,68 @@ python scripts/prune_results.py                             # 只报告；--appl
 
 ## 文档地图
 
-九份文档，**各管一件事，不互相复制**：
+> 编排原则：**按「你此刻要做什么」找文档**，不是按文件名找。
+> 一个目录一件事，同一件事只写一处，其他地方只引用。
 
-| 文件 | 读者 | 管什么 |
-|---|---|---|
-| `[AGENTS.md](./AGENTS.md)` | 改代码的 AI | **动手前必读**。DL-1…DL-8 防错、视觉参数定论、时间线四层归并、网页包契约、十步自验 |
-| `docs/spec/requirements.md` | 定范围的人 | R1–R12 需求口径。**R11** 两层加工、**R12** 全量归网页 |
-| `docs/spec/design.md` | 理解设计的人 | 为什么一张表、幂等主键、切片算法、清洗 C1–C13、§5.1 渲染层为何不是第三数据层 |
-| `docs/spec/interfaces.md` | 并行开发者 | **唯一接口真源**：函数签名、§5.8 页面模块契约、§3 写者归属 |
-| `docs/spec/data-sources.md` | 接新源的人 | 五源格式约定、设备注册规则、`device = ?` 禁令、分页里的设备呈现 |
-| `docs/spec/tasks.md` | 查进度的人 | B0–B14 批次状态、18 个已修缺陷、环境变量、待决项 |
-| `../../04-Areas/数字人生/AGENTS.md` | 读写 vault 的人 | 数据视角：路径分层、三层数据、§C-bis 网页包口径、D1–D11 防错 |
-| `../../AGENTS.md` | 所有人 | 工作区通用卡点 CP-1…CP-6 与 S1–S59（本模块只引用不复制）|
+```
+docs/
+├── spec/           设计真源（长期稳定，改动要慎重）
+├── postmortem/     复盘归档（按日期，只增不改，供追溯）
+├── WORKFLOW.md     管线怎么走
+├── HANDOFF.md      接手后先干什么
+└── phone-vision-*  phone-2 专项（runbook + 报告模板）
+```
+
+### 1. 我要动代码 → 先读这些
+
+| 文件 | 管什么 |
+|---|---|
+| `[AGENTS.md](./AGENTS.md)` | **动手前必读**。§C 十三条 DL 防错、§D 视觉参数定论与两层写法、§D.4 时间线四层归并、§G 十步自验 |
+| `docs/spec/interfaces.md` | **唯一接口真源**：函数签名、§5.8 页面模块契约、§3 写者归属 |
+| `../../AGENTS.md` | 工作区通用卡点 CP-1…CP-6 与 S1–S59（**只引用不复制**）|
+
+### 2. 我要理解设计 → spec/
+
+| 文件 | 管什么 |
+|---|---|
+| `docs/spec/requirements.md` | R1–R12 需求口径。**R11** 两层加工、**R12** 全量归网页 |
+| `docs/spec/design.md` | 为什么一张表、幂等主键、切片算法、清洗 C1–C13、§5.1 渲染层为何不是第三数据层 |
+| `docs/spec/data-sources.md` | 五源格式约定、设备注册规则、`device = ?` 禁令 |
+| `docs/spec/tasks.md` | B0–B14 批次状态、已修缺陷、环境变量、待决项 |
+
+### 3. 我要跑起来 / 接手 → 这两份
+
+| 文件 | 管什么 |
+|---|---|
+| `docs/WORKFLOW.md` | 五阶段数据流：采集 → 切片 → 片层 → 日层 → 发布。每段讲输入输出、判定标准、四道前处理闸、三层兜底 |
+| `docs/HANDOFF.md` | 接手第一件事：当前状态、日常重跑命令、五个别踩的坑、复盘索引 |
+
+### 4. 我要查「某个结论是怎么来的」→ postmortem/
+
+按时间归档，**只增不改**。每条结论（DL-1…DL-13、T27–T35）都能在这里找到实测过程。
+
+| 文件 | 结论 |
+|---|---|
+| `postmortem/2026-10-23-delivery.md` | 2026-10-23 交付总结（9,679 片、各项提速）|
+| `postmortem/perf-regression-2026-10-23.md` | DL-9：循环里放 SQL 导致 60 倍退化 |
+| `postmortem/vision-perf-and-blind-fix-2026-10-23.md` | DL-10：盲总结 + max_tokens 步长（DL-12）|
+| `postmortem/413-degenerate-image-2026-10-23.md` | DL-11：一张 1280×20 畸形图毒掉整片 |
+| `postmortem/quota-and-ratelimit-2026-10-23.md` | DL-13：额度读不到，只能探；限流≠耗尽 |
+| `postmortem/diary-style-2026-10-24.md` | 文体改造走过的弯路（含 631 片原文丢失）|
+| `postmortem/incremental-and-no-store-2026-10-24.md` | 日报不入库、两层缓存、`--days` 增量 |
+
+### 5. 我在做 phone-2 → 专项
+
+| 文件 | 管什么 |
+|---|---|
+| `docs/phone-vision-runbook.md` | phone-2 视觉运行手册（reader="text"、并发、验收）|
+| `docs/phone-vision-report-template.md` | 该专项的交付报告模板 |
+
+### 6. 我在读写 vault 数据 → 数据视角
+
+| 文件 | 管什么 |
+|---|---|
+| `../../04-Areas/数字人生/AGENTS.md` | 数据视角：路径分层、三层数据、§C-bis 网页包口径、D1–D11 防错 |
 
 **分工原则**：工程视角（本项目）讲「怎么改不闯祸」，数据视角（vault）讲「东西该放哪、是什么」；
 设计细节只在 `docs/spec/design.md`，任何一处改动都要同步检查这两份 AGENTS 的相关断言是否失效。

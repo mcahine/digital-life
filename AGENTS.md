@@ -66,7 +66,7 @@ digitallife/
   publish.py      publish_all：产出 md / NDJSON / manifest / zip
   cli.py          子命令：ingest / dbview / slice / vision / ocr / daily / publish / verify
 scripts/
-  smoke.py            主回归套件（**171 项**，含构造性探查与注入验红哨兵）
+  smoke.py            主回归套件（**181 项**，含构造性探查与注入验红哨兵）
   batch_vision.py     并发批量视觉识别（--all/--days/--workers/--rounds；写后复核**只上报不删行**）；
                       --blind 重做「有图但一张没送到模型」的历史盲总结（判据见 DL-10）
   prune_results.py    按 screenmemo-v1 约定清理不合规 slice_result（默认只报告）
@@ -97,11 +97,11 @@ tmp/                  运行产物（.gitignore 已排除）——**中间文件
 | **DL-6** | `IN (?,…)` 必须分批（≤500） | SQLite 变量上限 999，片数上万必抛 `too many SQL variables` |
 | **DL-7** | 按 `device` 过滤**不得写 `device = ?`**，必须走 `devices.sql_device_filter()`（生成 `IN (?,…)` 并把旧别名一并列入） | 设备 id 从 `pc`/`phone` 改成 `pc-main`/`phone-1` 后，9 处精确匹配（daily×4 / slicer×3 / vision×1 / publish×2）全部静默返回空：时段 0 片、事件 0 条、视觉选不到片。库里历史行仍是旧值，靠别名 IN 才对得上 |
 | **DL-8** | 点事件（`end_utc_ms IS NULL` 的 app/web）消费时必须补时长 `POINT_EVENT_MS = 60_000` | shion 28,805 条 100% 无 end，`ce > cs` 恒假，整类被 dbview 丢掉——表现为"明明有 web 记录却没展示" |
-| **DL-9** | **循环里不得出现 SQL 调用**。需要「每片/每行一个派生值」时，先一次性批量查出原料，再在内存里比较 | 给「无画面描述」加标注时逐片查 event 表，EXPLAIN 显示走 `ix_event_kind` 而非时间索引（`kind='screen'` 命中 10 万行），单日 `load_slices` 从 1.6s 退化到 **103s**，753 页重建从 40 分钟变 5 小时。改为「一次取当日有描述的时间点 + 内存比较」后回到 1.6s。详见 `docs/perf-regression-2026-10-23.md` |
+| **DL-9** | **循环里不得出现 SQL 调用**。需要「每片/每行一个派生值」时，先一次性批量查出原料，再在内存里比较 | 给「无画面描述」加标注时逐片查 event 表，EXPLAIN 显示走 `ix_event_kind` 而非时间索引（`kind='screen'` 命中 10 万行），单日 `load_slices` 从 1.6s 退化到 **103s**，753 页重建从 40 分钟变 5 小时。改为「一次取当日有描述的时间点 + 内存比较」后回到 1.6s。详见 `docs/postmortem/perf-regression-2026-10-23.md` |
 | **DL-10** | **跨层传递的中间结果必须有端到端哨兵**，不能靠每层自报成功 | vision 层「收集到 23 张，missing=0」+ llm 层「23 张缺失，已跳过」，两层日志各自正常，合起来是「一张图都没送」。PC 侧 1,874 条视觉总结因此全是**盲总结**（`_meta.images_sent=0`）。哨兵见冒烟 T27（断言 `_chat` 传的是 data URL 而非 zip 相对路径）|
-| **DL-11** | **上游报错必须按语义分三类处置**：可重试（`429` / `413` / `5xx`）、不可重试（`400 sensitive` / `401`）、需换抽样（`400` 的其他文案）。退避**必须跨过 rpm 的 60 秒滚动窗**，否则重试必然再撞同一堵墙 | 三条实测：①`429 rpm exhausted` 用 `tries=4 / max=20s`（共 30s）重试**全部再撞**，因为还在 60s 窗内；改 `tries=5 / max=65s` 后才有效。②`413` 文案写 `payload too large`，但实测**与体积无关**（base64 仅 0.16–0.53MB）。**真因是畸形截图**：一张 **1280×20** 的退化 webp（ManicTime 偶发写入，宽高比 64:1）**单独发送就必触发 413**，而同片 6 张正常图一起发完全成功（138s/4481 字）—— 三组对照闭合（BAD-only 413 / GOOD-only OK / GOOD+BAD 413）。**一张退化图毒掉整片**，且降并发、缩图、抽样全无效。修法：前处理过滤（宽高比 >12 或短边 <64 不送，见 `_is_degenerate`），哨兵 T31i/T31j。详见 `docs/413-degenerate-image-2026-10-23.md`。③`400 sensitive image` 是内容判定，重发必错——实测 ≥16 张图必触发（2/2 复现），故送图打顶 8 张。哨兵见 T30a–e（含 413 可重试、400 不可重试两条反向断言）|
+| **DL-11** | **上游报错必须按语义分三类处置**：可重试（`429` / `413` / `5xx`）、不可重试（`400 sensitive` / `401`）、需换抽样（`400` 的其他文案）。退避**必须跨过 rpm 的 60 秒滚动窗**，否则重试必然再撞同一堵墙 | 三条实测：①`429 rpm exhausted` 用 `tries=4 / max=20s`（共 30s）重试**全部再撞**，因为还在 60s 窗内；改 `tries=5 / max=65s` 后才有效。②`413` 文案写 `payload too large`，但实测**与体积无关**（base64 仅 0.16–0.53MB）。**真因是畸形截图**：一张 **1280×20** 的退化 webp（ManicTime 偶发写入，宽高比 64:1）**单独发送就必触发 413**，而同片 6 张正常图一起发完全成功（138s/4481 字）—— 三组对照闭合（BAD-only 413 / GOOD-only OK / GOOD+BAD 413）。**一张退化图毒掉整片**，且降并发、缩图、抽样全无效。修法：前处理过滤（宽高比 >12 或短边 <64 不送，见 `_is_degenerate`），哨兵 T31i/T31j。详见 `docs/postmortem/413-degenerate-image-2026-10-23.md`。③`400 sensitive image` 是内容判定，重发必错——实测 ≥16 张图必触发（2/2 复现），故送图打顶 8 张。哨兵见 T30a–e（含 413 可重试、400 不可重试两条反向断言）|
 | **DL-12** | **模型请求的 `max_tokens` 是"步长"不是"安全带"**：起始给够用的小预算，只在「空内容」时翻倍放大 | 交替各跑 2 次实测（同片 8 图）：`65536` → 269.9s/217.0s，推理 23,439/20,568 token；`8192` → 189.9s/**71.4s**，推理 1,749/1,383 token，输出字数反而更多（10,182 vs 6,865）。上限越宽模型越展开长推理，耗时差 3–4 倍。现为 `MAX_TOKENS=8192` 起、`MAX_TOKENS_CEILING=65536` 封顶（T29）|
-| **DL-13** | **额度不可读，只能探；且「限流」与「额度耗尽」必须分开处置** | 上游**不暴露额度**（2026-10-23 实测）：响应头无 `x-ratelimit-*`（`access-control-expose-headers` 只暴露三个文件传输头）；`/v1/usage`、`/v1/quota`、`/v1/rate_limit`、`/v1/me` **全 404**（`/v1/models` 200，证明路径没错）；bridge 的 `quota.remaining` 四通道全 `null`。因此只能用 8-token 探针间接判断。**关键陷阱**：429 正文的 `type` 一律是 `quota_exceeded_error`，但 `message` 才是真语义 —— `rpm exhausted` 是**每分钟限流**（等 90s 即恢复，停整批是浪费），无 rpm 字样才是**额度耗尽**（必须停下等刷新）。**按 `type` 分类必错**。实现见 `batch_vision._classify` + `wait_for_quota`，哨兵 T31a–h，详见 `docs/quota-and-ratelimit-2026-10-23.md` |
+| **DL-13** | **额度不可读，只能探；且「限流」与「额度耗尽」必须分开处置** | 上游**不暴露额度**（2026-10-23 实测）：响应头无 `x-ratelimit-*`（`access-control-expose-headers` 只暴露三个文件传输头）；`/v1/usage`、`/v1/quota`、`/v1/rate_limit`、`/v1/me` **全 404**（`/v1/models` 200，证明路径没错）；bridge 的 `quota.remaining` 四通道全 `null`。因此只能用 8-token 探针间接判断。**关键陷阱**：429 正文的 `type` 一律是 `quota_exceeded_error`，但 `message` 才是真语义 —— `rpm exhausted` 是**每分钟限流**（等 90s 即恢复，停整批是浪费），无 rpm 字样才是**额度耗尽**（必须停下等刷新）。**按 `type` 分类必错**。实现见 `batch_vision._classify` + `wait_for_quota`，哨兵 T31a–h，详见 `docs/postmortem/quota-and-ratelimit-2026-10-23.md` |
 
 ---
 
@@ -181,8 +181,8 @@ apps, categories, timeline, key_actions,
 described_images, image_tags, image_descriptions, overall_summary
 ```
 
-`overall_summary` 必须是三节、顺序固定；**每节写成连贯叙述段落**（日记体，不是清单——
-2026-10-24 改，详见 D.7），每节正文 ≥`MIN_SECTION_CHARS`(30) 字：
+`overall_summary` 必须是三节、顺序固定，**每节至少 3 条列表要点**（清单体——
+片层是证据；日记体只在日层，详见 D.7）：
 
 ```
 ## 关键操作
@@ -272,33 +272,37 @@ section 模块契约（新增 section 照此写）：模块暴露 `ANCHOR` / `LA
   **不要把 ai_image_meta 的「表内有效描述率 99%」误读成「全量截图覆盖 99%」**——
   这两个分母不同，是本轮最容易搞错的一点。
 
-### D.7 两层都必须是「日记体」（2026-10-24 定稿）
+### D.7 片层清单体、日层日记体（2026-10-24 用户最终裁决）
 
-**片层与日层是两种写法，别混。**
+🔴 **两层是两种写法，绝不能混。**
+
+- **片层 = 证据**：清单体。三节 + 每条以时间区间开头，条目化、可核对。
+- **日层 = 读物**：日记体。自然段叙事，讲这一天做了什么。
+
+用户原话：「视觉总结内容的片层就原来格式挺好，然后才是日报是日记体，讲述一天做了什么」。
+
+**我曾把这条做反过**：把文体要求放到片层，改提示词 + R5 改字数 + 加 R5b 禁止列表。
+后果是库里 3,739 片清单体数据全部判不合格（`ok=False`、`R5b.summary_prose` × 3），
+而且为了修回来，3,650 片被改写成叙述体、其中 **631 片原文永久丢失**
+（`raw_response` 里没有，只能按格式重新生成）。**这是本轮最大的教训：
+先确定「改哪一层」，再动手。**
 
 #### 片层 `overall_summary`（`screenmemo-v1` 第 4.4 节）
 
-🔴 **像写日记一样**：每节写成**连贯叙述段落**，不要清单、不要 Markdown 列表项、
-**不要给每句加时间戳前缀**。三节标题保留（结构骨架不动），节内是叙述。
+**清单体**：每节至少 3 条 Markdown 列表项，「关键操作」每条以 `- HH:MM:SS-HH:MM:SS：` 开头。
+时刻必须来自 DB 时间线或截图实际时间，不许编。
 
-反例（旧格式，已废）：
-
-```text
-## 关键操作
-- 06:03:30-06:04:16：在 Obsidian 章梗概笔记中梳理…
-- 06:04:51-06:05:30：继续编辑第四十一至四十六章…
-```
-
-这是审计日志。正例（改后实测，632 字 / schema_ok=True）：
+样本（库里真实数据）：
 
 ```text
 ## 关键操作
-先打开了 DeepSeek Harness 的插件管理页，逐个查看已安装插件的开关状态与版本信息…
-接着回到对话区，把正在进行的会话重命名成「分析 dsh 自带的上下文系统」…
+- 03:13:17-03:16:04：在 biji.com 笔记应用中浏览了多条笔记和语音笔记的标题摘要
+- 03:16:04-03:16:23：切换到 ZCode 代码编辑器查看本地化网页下载说明文档
+- 03:16:23-03:16:58：短暂在 Kimi Code Web 编程助手中看过代码审查结果
 ```
 
-配套改动：`schema_check` 的 **R5 从「每节 ≥3 条列表」改为「每节 ≥`MIN_SECTION_CHARS`(30) 字」** ——
-叙述体天然没有列表项，旧规则会把所有合格式的片判成不合格。
+校验口径：`schema_check` 的 **R5 数列表项，每节至少 3 条**。
+（中途我曾把它改成「每节 ≥30 字」并加 R5b 禁止列表 —— 已回滚，见本节开头的教训。）
 
 #### 日层 `output_text`（`DAILY_PROMPT`）
 
@@ -377,7 +381,7 @@ python -m digitallife.cli daily    --date 2026-08-13                # 日叙事
 python -m digitallife.cli publish  --no-zip                         # 产出 md + NDJSON + manifest
 python -m digitallife.cli verify                                    # 各源计数与跨度
 
-python scripts/smoke.py                                     # 171 项主回归
+python scripts/smoke.py                                     # 181 项主回归
 # 批量视觉：32 并发 + 超时 240 + 60s 退避是实测最优组合（净 5.7 片/分，见 D.2）
 DL_LLM_TIMEOUT=240 python scripts/batch_vision.py --all --workers 32 --rounds 14
 python scripts/rebuild_daily.py                             # 批量重生成日报
@@ -399,7 +403,7 @@ export DL_WORK_DIR="<ManicTime 解包目录>"
 
 ## §G 改完必须自己验的十件事
 
-1. `python scripts/smoke.py` → **必须 171/0**（不是"大概绿了"）。
+1. `python scripts/smoke.py` → **必须 181/0**（不是"大概绿了"）。
 2. 幂等：同一批数据跑两遍，`count_events` 不变。
 3. 截图守恒：叶子片 `SUM(image_count)` == 源 `kind='screen'` 事件数（逐设备对齐）。
 4. 结构合规：`python scripts/prune_results.py` → 不合规必须 0（注意：这只是报告口径，

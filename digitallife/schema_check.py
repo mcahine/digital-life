@@ -115,34 +115,23 @@ def validate_structured(structured: dict | None, *, image_count: int = 0,
                                 "三个小节的顺序必须是 关键操作 → 主要活动 → 重点内容"))
         # R5 每节必须有实质内容
         #
-        # 2026-10-24 改：原规则要求「每节至少 3 条 Markdown 列表项」，那是旧格式
-        # （清单体）的产物。用户要求视觉总结「像写日记一样」，改成连贯叙述段落，
-        # 于是列表项天然为 0 —— 旧规则会把所有合格式的片都判不合格。
+        # R5 每节至少 3 条列表要点。
         #
-        # 新规则按「实质内容量」判：每节去掉标题与空白后至少 MIN_SECTION_CHARS 字。
-        # 这样既能拦住空节与敷衍的一句话，又不强制某种排版。
+        # 2026-10-24 用户最终裁决：**片层保持原清单格式**（它是读图证据的载体），
+        # 日记体只用在日层（日报讲一天做了什么）。所以这条规则回到「数列表项」。
+        #
+        # 中途我曾把它改成「每节 ≥30 字」并加 R5b 禁止列表 —— 那是把文体要求
+        # 错放到了证据层，实测会让库里所有清单体数据判不合格（ok=False，
+        # R5b.summary_prose × 3）。已回滚。
         if all(h in s for h in SUMMARY_HEADS):
             for idx, h in enumerate(SUMMARY_HEADS):
                 start = s.find(h) + len(h)
                 end = s.find(SUMMARY_HEADS[idx + 1]) if idx + 1 < len(SUMMARY_HEADS) else len(s)
-                body = s[start:end].strip()
-                if len(body) < MIN_SECTION_CHARS:
-                    issues.append(Issue("R5.summary_section",
-                                        "「%s」只有 %d 字，内容明显不足（要求 ≥%d 字）"
-                                        % (h, len(body), MIN_SECTION_CHARS)))
-                # R5b 必须是日记体叙述，不能退回清单。
-                # 实测（2026-10-24）：只靠提示词要求「不要列表」，模型仍会有一半概率
-                # 输出「- 」开头的清单项，所以必须在校验层拦住，让 rework 循环
-                # 把这条具体理由回灌模型重做 —— 这正是 schema_check 的设计用途。
-                n_bullet = len(re.findall(r"^\s*[-*+]\s+\S", body, re.M))
-                if n_bullet:
-                    # 回灌给模型的指令要可直接执行：光说「不要列表」它会把同一批句子
-                    # 原样搬成段落（每句一行）或继续加「- 」。必须点明「合并成一段」。
-                    issues.append(Issue("R5b.summary_prose",
-                                        "「%s」里有 %d 个列表项；要求写成连贯叙述段落（日记体）。"
-                                        "请把这一节的这些句子用逗号/句号连成一段连续的话，"
-                                        "删掉所有行首的 - 或 *，也不要每句单独占一行"
-                                        % (h, n_bullet)))
+                body = s[start:end]
+                n = len(re.findall(r"^\s*[-*+]\s+\S", body, re.M))
+                if n < 3:
+                    issues.append(Issue("R5.summary_bullets",
+                                        "「%s」只有 %d 条要点，要求至少 3 条" % (h, n)))
 
     # R6 timeline 条目形状
     tl = structured.get("timeline")

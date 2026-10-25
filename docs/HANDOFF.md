@@ -14,7 +14,7 @@
 | 日报 | 753 篇 |
 | 时段页 | 753 个 html，211.9 MB |
 | 片层 md | 9,928 |
-| 冒烟 | **171 / 0** |
+| 冒烟 | **181 / 0** |
 | git | 模块独立仓库，7 次提交，数据不入库 |
 
 ## 二、日常重跑（已全部并行化）
@@ -27,7 +27,7 @@ unset DL_DB DL_WORK_DIR
 python scripts/build_slice_html.py --all --workers 6   # 753 页约 6 分钟
 python scripts/rebuild_daily.py --workers 4           # 753 天约 3.7 分钟
 python -m digitallife.cli publish --no-zip
-python scripts/smoke.py                               # 必须 171/0
+python scripts/smoke.py                               # 必须 181/0
 python scripts/prune_results.py                       # 不合规必须 0
 ```
 

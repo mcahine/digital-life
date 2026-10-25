@@ -432,15 +432,13 @@ def main() -> int:
             "timeline": [{"start": "09:00:00", "end": "10:00:00", "app": "Obsidian", "title": "笔记"}],
             "key_actions": [{"range": "09:00:00-10:00:00", "action": "写作", "detail": "写日报"}],
             "described_images": [], "image_tags": [], "image_descriptions": [],
-            # 日记体（2026-10-24）：每节是连贯叙述段落，不带时间戳前缀、不用列表。
-            # 旧样例是「- 09:00:00-10:00:00：…」清单，改造后它本身就不该算合格。
+            # 片层是清单体（2026-10-24 最终裁决）：三节 + 每条以时间区间开头。
+            # 中途我曾把这份样例改成叙述体，那是把日层的文体要求错放到片层。
             "overall_summary": (
-                "## 关键操作\n先在 Obsidian 里打开当天要写的日报草稿，"
-                "写到一半切到 Chrome 查了一会儿资料，随后又回到编辑器接着写。\n\n"
-                "## 主要活动\n时间基本都花在撰写日报正文上，"
-                "查资料和整理结构化字段只占了零头。\n\n"
-                "## 重点内容\n正文最终写到约七百字，"
-                "应用名一律引用真实名称，关键词覆盖也比较充分。\n"),
+                "## 关键操作\n- 09:00:00-10:00:00：打开 Obsidian 写日报\n"
+                "- 09:30:00：切到 Chrome 查资料\n- 09:50:00：回到编辑器\n\n"
+                "## 主要活动\n- 撰写日报正文\n- 查阅数据结构文档\n- 整理结构化字段\n\n"
+                "## 重点内容\n- 正文约 700 字\n- 引用真实应用名\n- 关键词覆盖充分\n"),
         }
         check("T13 合格样例通过校验", _vs(good).ok is True)
         bad_cases = [
@@ -1221,27 +1219,32 @@ def main() -> int:
         check("T31k batch_vision 不删结构不合格的行（改由 prune_results 清理）",
               "DELETE FROM slice_result" not in _bsrc, _bsrc[:60])
 
-        # 片层必须是日记体叙述，不能退回清单（2026-10-24 用户要求）。
-        # 实测只靠提示词约束不住（3 片里 1 片仍输出「- 」清单），所以校验层必须拦住，
-        # 否则 rework 循环没有机会纠正，坏格式直接入库。
+        # **片层是清单体，日层才是日记体**（2026-10-24 用户最终裁决）。
+        #
+        # 中途我曾把文体要求错放到片层：R5 改成「每节 ≥30 字」+ 加 R5b 禁止列表。
+        # 后果是库里所有清单体数据判不合格（ok=False、R5b.summary_prose × 3），
+        # 等于把「读图证据」当「读物」审。已回滚。
+        # 这两个哨兵现在钉的是**回滚后的契约**：清单体必须通过、且不再有 R5b。
         from digitallife.schema_check import validate_structured as _vs
-        _prose = ("## 关键操作\n先打开页面逐个查看插件状态，接着回到对话区把会话重命名。"
-                  "随后切到面板看配额，最后回来核对代码改动。\n"
-                  "## 主要活动\n精力集中在对上下文系统的分析上，占了大半时间，"
-                  "剩下零星花在查配额和读文章上。\n"
-                  "## 重点内容\n围绕三个模块怎么合并成统一插件展开，"
-                  "已经清理两个文件并把配置迁到新位置。")
-        _bullets = ("## 关键操作\n- 打开页面查看插件\n- 回到对话区重命名会话\n- 切到面板看配额\n"
+        _bullets = ("## 关键操作\n- 09:00:00-09:05:00：打开页面查看插件状态\n"
+                    "- 09:05:00-09:12:00：回到对话区重命名会话\n- 09:12:00-09:15:00：切到面板看配额\n"
                     "## 主要活动\n- 上下文系统分析占大半时间\n- 查配额与读文章占少量\n"
-                    "## 重点内容\n- 三模块合并成统一插件\n- 清理两个文件并迁配置\n")
-        _vp = _vs({"overall_summary": _prose}, require_images=False)
-        _vb = _vs({"overall_summary": _bullets}, require_images=False)
-        check("T34a 叙述体通过 R5b（不被误判成清单）",
-              not any(i.rule == "R5b.summary_prose" for i in _vp.errors),
-              str([i.rule for i in _vp.errors][:3]))
-        check("T34b 清单体被 R5b 拦下（提示词约束不住时靠校验兜底）",
-              any(i.rule == "R5b.summary_prose" for i in _vb.errors),
-              str([i.rule for i in _vb.errors][:3]))
+                    "- 切换较多，约十余次\n"
+                    "## 重点内容\n- 三模块合并成统一插件\n- 清理两个文件并迁配置\n"
+                    "- tools.sdk 体积占 83.5%\n")
+        _v = _vs({"overall_summary": _bullets,
+                  "apps": [{"name": "Obsidian", "duration": "00:15:00", "note": "写作"}],
+                  "categories": ["办公"],
+                  "timeline": [{"start": "09:00:00", "end": "09:15:00",
+                                "app": "Obsidian", "title": "笔记"}],
+                  "key_actions": [{"range": "09:00:00-09:15:00", "action": "写作", "detail": "写日报"}],
+                  "described_images": [], "image_tags": [], "image_descriptions": []},
+                 require_images=False)
+        check("T34a 清单体片层通过校验（片层是证据，不是读物）",
+              _v.ok is True, str([i.rule for i in _v.errors][:3]))
+        check("T34b 校验器不再有 R5b（文体要求只在日层，不在证据层）",
+              not any(i.rule.startswith("R5b") for i in _v.errors),
+              str([i.rule for i in _v.errors][:3]))
 
         # 日报不得回退成「逐片粘贴」（R12）。2026-10-24 之前 751/753 篇都带
         # 「## 视觉总结」+ 每片原文，2026-08-13.md 达 1,477 行 / 138 KB。
