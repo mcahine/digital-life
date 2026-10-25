@@ -64,7 +64,8 @@ def load_slices(con: sqlite3.Connection, date_key: str, device: str) -> list[dic
     where, params = dv.sql_device_filter(device, "s.device")
     rows = con.execute(
         "SELECT s.slice_id, s.start_utc_ms, s.end_utc_ms, s.image_count, s.event_count, "
-        "       r.overall_summary, r.structured_json, r.model, r.conflict_count "
+        "       r.overall_summary, r.structured_json, r.model, r.conflict_count, "
+        "       s.status, s.split_of "
         "FROM slice s LEFT JOIN slice_result r ON r.slice_id = s.slice_id "
         "WHERE s.start_utc_ms >= ? AND s.start_utc_ms < ? AND " + where + " "
         "ORDER BY s.start_utc_ms",
@@ -92,6 +93,11 @@ def load_slices(con: sqlite3.Connection, date_key: str, device: str) -> list[dic
             "conflict_count": int(r["conflict_count"] or 0),
             "present": r["model"] is not None,
             "has_description": _has_desc,
+            # 父子片关系（2026-10-24）。父片 image_count 超上限（24）会被递归二分，
+            # 只有叶子片跑视觉。页面必须区分，否则父片会显示成
+            # 「未跑视觉模型 / 本片尚无视觉总结」—— 那是误导：它其实被切分了。
+            "status": (r["status"] or ""),
+            "split_of": (r["split_of"] or ""),
         })
     return out
 

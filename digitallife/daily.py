@@ -835,44 +835,17 @@ def render_narrative(date_key: str, breakdown: dict, structures: dict,
 
 def render_daily(date_key: str, breakdown: dict, structures: dict[str, dict],
                  slices_by_dev: dict[str, list[dict]], narrative: str | None = None) -> str:
-    dd = breakdown["devices"]
-    has_data = any(v["event_count"] or v["slice_count"] for v in dd.values())
-    total_events = sum(v["event_count"] for v in dd.values())
-    total_slices = sum(v["slice_count"] for v in dd.values())
-    total_sums = sum(v["summary_count"] for v in dd.values())
+    """[已停用] 模板渲染路径，保留仅为兼容旧调用方。
 
-    lines = ["---", f"date: {date_key}", "source: digital-life", "---", "",
-             f"# {date_key} 数字人生日报", "",
-             "> 机器总结（日层，由 digital-life 生成）。周/月/季/年由日记系统自行滚动，"
-             "本文件不含这些粒度。"]
-    if has_data:
-        from . import devices as _dl
-        def _dev_label(d):
-            k = _dl.kind_of(d)
-            return _dl.label_of(d) if len(_dl.by_kind(k)) > 1 else ("电脑" if k == "pc" else "手机")
-        labels = "、".join(_dev_label(d) for d in DEVICES
-                          if dd[d]["event_count"] or dd[d]["slice_count"])
-        lines.append(f"> 当日事件 {total_events} 条 · 时段 {total_slices} 片 · "
-                     f"视觉总结 {total_sums} 片 · 有数据设备：{labels}")
-    lines.append("> 各设备时长独立记账，不相加为总时长（同日两设备并行，相加即重复计入）。")
-    lines.append("")
+    2026-10-24 用户裁决：「我不需要日报里的视觉总结搞模板铁铁，
+    render_daily 这种输出长列表的无效」。
 
-    if narrative:
-        lines += ["## 当日概述", "", narrative.strip(), ""]
-
-    if not has_data:
-        lines += ["## 电脑使用", "", "- （当日无数据）", "",
-                  "## 手机使用", "", "- （当日无数据）", ""]
-        return "\n".join(lines + _render_key_actions(slices_by_dev, date_key)).rstrip("\n") + "\n"
-
-    # include_summaries=False：2026-10-24 按 R12 收口。
-    # 旧版这里传 True，于是每片总结都变成一行「- 06:48-06:52 [电脑] …」；
-    # 2026-09-15 实测 248 条，日报沦为流水账。片层全文归时段网页。
-    for dev in DEVICES:
-        lines += _render_device(dev, dd[dev], structures.get(dev) or {},
-                                slices_by_dev.get(dev, []), include_summaries=False)
-    lines += _render_key_actions(slices_by_dev, date_key)
-    return "\n".join(lines).rstrip("\n") + "\n"
+    它的问题在 _render_key_actions：把当天每片的每条 action 都列出来
+    （2026-08-14 实测 168 条、2026-09-15 实测 248 条），日报沦为流水账。
+    build_daily 已改为只走 render_narrative；这里直接委托过去，
+    避免任何残留调用产生长列表。
+    """
+    return render_narrative(date_key, breakdown, structures, slices_by_dev, narrative)
 
 
 # ---------------------------------------------------------------- 可选：模型概述
@@ -1034,10 +1007,13 @@ def build_daily(con, date_key: str, client=None, persist: bool = True) -> dict:
             if kept:
                 narrative = kept
                 model = prev["model"]
-    if narrative:
-        output = render_narrative(date_key, breakdown, structures, slices_by_dev, narrative)
-    else:
-        output = render_daily(date_key, breakdown, structures, slices_by_dev, narrative)
+    # 日报只有一条渲染路径：模型叙事（2026-10-24 用户裁决）。
+    #
+    # 用户原话：「我不需要日报里的视觉总结搞模板铁铁，render_daily 这种输出长列表的无效」。
+    # 旧逻辑是 narrative 为空就走 render_daily —— 那条路径会输出「## 关键操作」
+    # 加上当天每片的每条 action（2026-08-14 实测 168 条），正是被反复否掉的流水账。
+    # 模板路径已不再被调用；没有叙事时 render_narrative 只出陈述性统计，不出长列表。
+    output = render_narrative(date_key, breakdown, structures, slices_by_dev, narrative)
 
     structured = {
         "date": date_key, "layer": LAYER, "devices": structured_devices,

@@ -1290,6 +1290,8 @@ def main() -> int:
         # 缓存层：数据层指纹必须用全限定列名（join 后 created_at 会重名，
         # 实测直接抛 ambiguous column name: created_at，建页 rc=1 空转 0.4s）。
         import scripts.build_slice_html as _sd  # noqa: E402
+        import scripts.slice_pages.vision as _sd_vision  # noqa: E402
+        import scripts.slice_pages.timeline as _sd_timeline  # noqa: E402
         _bsrc2 = _insp2.getsource(_sd)
         check("T35c 数据层缓存指纹用 r.created_at（避免 ambiguous column）",
               "MAX(r.created_at)" in _bsrc2, "")
@@ -1309,6 +1311,38 @@ def main() -> int:
                     _has = True
         check("T35d rebuild_daily 的 build_daily 调用带 persist=False", _has,
               "未找到 persist=False 实参")
+        # 日报只允许一条渲染路径：模型叙事（2026-10-24 用户裁决）。
+        # render_daily 那条会输出「## 关键操作」+ 当天每片的每条 action
+        # （2026-08-14 实测 168 条），正是被否掉的流水账。
+        _bd_src = _insp2.getsource(_daily.build_daily)
+        check("T36a build_daily 只走 render_narrative，不再分支到 render_daily",
+              "render_narrative(date_key" in _bd_src, _bd_src[:60])
+        # 父子片关系：父片必须有子片清单，不能只说「尚无总结」。
+        _vp_src = _insp2.getsource(_sd_vision.panel)
+        check("T36b 视觉区渲染父子片关系（父片列出子片）",
+              "kids_of" in _vp_src and "已切分为" in _vp_src, _vp_src[:60])
+        check("T36c 父片判定只看 status（不把有总结的中间层误标成父片）",
+              '== "split"' in _vp_src, _vp_src[:60])
+        # 链接标题：渲染期只读缓存，不联网。
+        check("T36d 时间线用 linktitle 补标题",
+              "linktitle.display_title" in _insp2.getsource(_sd_timeline.panel), "")
+        # meta 必须在每个分支都赋值，否则会沿用上一张卡片的元信息
+        # （2026-08-14 实测：00:30-00:45 显示成「已切分为 2 个子片」）。
+        _bro = _vp_src.split("for s in tops:")[1] if "for s in tops:" in _vp_src else ""
+        _nbranch = sum(1 for ln in _bro.splitlines()
+                       if ln.strip().startswith("meta = "))
+        check("T36e 每张卡片都重算 meta（防止串用上一张卡片的元信息）",
+              _nbranch >= 4, "meta 赋值处 %d 个" % _nbranch)
+        # 标题缓存必须落在项目根 tmp/ 下。
+        # 实测：linktitle.py 在 scripts/slice_pages/ 里，写成 parents[1] 会落到
+        # scripts/tmp/ —— 抓了 54 条标题，建页一条都读不到，而两边都不报错。
+        from slice_pages import linktitle as _lt
+        _root = _sd.__file__
+        import pathlib as _pl
+        _want = _pl.Path(_root).resolve().parents[1] / "tmp"
+        check("T36f 标题缓存路径落在项目根 tmp/（不是 scripts/tmp/）",
+              _lt._CACHE.parent == _want,
+              "实际 %s" % _lt._CACHE.parent)
     except Exception as _e:  # noqa: BLE001
         check("T31 额度看门狗", False, f"{type(_e).__name__}: {_e}")
 

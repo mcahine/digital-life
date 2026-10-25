@@ -7,7 +7,7 @@
 from __future__ import annotations
 
 from digitallife.timeline_merge import display_title, merge_browser_web, span_seconds
-from slice_pages import base
+from slice_pages import base, linktitle
 
 ANCHOR = "timeline"
 LABEL = "时间线"
@@ -37,7 +37,12 @@ def panel(pid: str, ctx, *, hidden: bool = False) -> tuple[str, int]:
         major = span_seconds(start, end) >= MAJOR_SECONDS
         title = display_title(row)
         url = str(row.get("link_url") or "").strip()
-        head = base.link(title, url) if url else base.esc(title)
+        # 只有域名当标题时，用缓存里的网页标题替换（渲染期不联网，见 linktitle）
+        if url:
+            shown, _ext = linktitle.display_title(title, url)
+            head = base.link(shown or title, url)
+        else:
+            head = base.esc(title)
         extra = " data-extra hidden" if i > SHOW_FIRST else ""
         out.append('<tr%s><td class="t num muted">%s</td><td class="ev%s">%s</td></tr>' % (
             extra, base.esc(base.span(start, end)), " major" if major else "", head))
