@@ -1290,6 +1290,22 @@ def main() -> int:
         _bsrc2 = _insp2.getsource(_sd)
         check("T35c 数据层缓存指纹用 r.created_at（避免 ambiguous column）",
               "MAX(r.created_at)" in _bsrc2, "")
+        # 批量重建也必须 persist=False。实测教训：改完 publish 走现算后，
+        # 一次 rebuild_daily 全量重建又把 5.7 MB output_text 写回了库。
+        # 断言必须落在**调用语句**上，不能只 grep 源码里有没有 persist=False 字样：
+        # 第一版就是这么写的，而我在旁边留了一行带 persist=False 的注释，
+        # 注入「删掉参数」后断言仍全绿（S20 假绿）。改成用 AST 找 Call 节点的关键字。
+        import ast as _ast  # noqa: E402
+        import scripts.rebuild_daily as _rbd  # noqa: E402
+        _tree = _ast.parse(_insp2.getsource(_rbd))
+        _has = False
+        for _n in _ast.walk(_tree):
+            if isinstance(_n, _ast.Call) and getattr(_n.func, "id", "") == "build_daily":
+                if any(k.arg == "persist" and getattr(k.value, "value", None) is False
+                       for k in _n.keywords):
+                    _has = True
+        check("T35d rebuild_daily 的 build_daily 调用带 persist=False", _has,
+              "未找到 persist=False 实参")
     except Exception as _e:  # noqa: BLE001
         check("T31 额度看门狗", False, f"{type(_e).__name__}: {_e}")
 

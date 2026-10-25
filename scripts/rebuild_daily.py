@@ -33,7 +33,10 @@ def _one(day: str) -> tuple[str, bool, str]:
     con.row_factory = sqlite3.Row
     try:
         con.execute("PRAGMA busy_timeout=30000")
-        build_daily(con, day)
+        # persist=False：批量重建只更新 vault 文件，不把渲染结果写回库。
+        # 2026-10-24 用户裁决「日报不需要存储到数据库」—— 这里曾经用默认
+        # persist=True，一次全量重建就把 5.9 MB output_text 又写回去了。
+        build_daily(con, day, persist=False)
         con.commit()
         return (day, True, "")
     except Exception as exc:  # noqa: BLE001
