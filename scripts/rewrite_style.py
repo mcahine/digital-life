@@ -35,10 +35,10 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+# T1 (2026-10-25): sys.path.insert removed -- package is installable via pip install -e .
 
 from digitallife import paths  # noqa: E402
-from digitallife.llm import ChatClient  # noqa: E402
+from digitallife.produce.llm import ChatClient
 
 BULLET_RE = re.compile(r"^\s*[-*+]\s+\S", re.M)
 FENCE = chr(96) * 3   # 三个反引号；用 chr 拼，避免本文件出现代码围栏字符

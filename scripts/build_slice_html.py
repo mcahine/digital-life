@@ -26,13 +26,13 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-sys.path.insert(0, str(Path(__file__).resolve().parent))
+# T1 (2026-10-25): sys.path.insert removed -- package is installable via pip install -e .
+# T1 (2026-10-25): sys.path.insert removed -- package is installable via pip install -e .
 
 from digitallife import paths  # noqa: E402
-from digitallife.dbview import build_day_structure  # noqa: E402
-from slice_pages import base, apps, timeline, vision, web  # noqa: E402
-from slice_pages.contract import (  # noqa: E402
+from digitallife.domain.dbview import build_day_structure
+from digitallife.render import base, apps, hourbar, timeline, vision, web  # noqa: E402
+from digitallife.render.contract import (  # noqa: E402
     PC_DEVICE, PHONE_DEVICE, Ctx, device_label, load_slices,
 )
 
@@ -52,7 +52,7 @@ _DATA_CACHE = Path(__file__).resolve().parents[1] / "tmp" / ".datacache"
 
 
 def _data_fp(con: sqlite3.Connection, date_key: str) -> str:
-    from slice_pages.contract import day_range_ms
+    from digitallife.render.contract import day_range_ms
     lo, hi = day_range_ms(date_key)
     h = hashlib.sha1()
     for sql in (
@@ -116,7 +116,7 @@ def build_ctx(con: sqlite3.Connection, date_key: str) -> Ctx:
 
 
 def _counts(con: sqlite3.Connection, date_key: str) -> dict:
-    from slice_pages.contract import day_range_ms
+    from digitallife.render.contract import day_range_ms
     lo, hi = day_range_ms(date_key)
     row = con.execute(
         "SELECT COUNT(*), SUM(CASE WHEN kind='web' THEN 1 ELSE 0 END), "
@@ -148,8 +148,13 @@ def _device_panels(ctx: Ctx, mod, *, order: list[str] | None = None) -> tuple[st
         # phone-2 都截成 "phone"，两个 panel 撞同一个 id —— 后来者覆盖前者，
         # 页面上直接少一台设备（2026-10-22 加第二部手机时踩到）。
         pid = "%s-%s" % (mod.ANCHOR, dev)
+        # 缓存容器**共享**（不是复制）：merge 后的时间线行与跨 section 标题索引
+        # 是一次建页里所有 section、所有设备共用的同一份真值。
+        # 各造一份会让「时间线点数」与「网站显示文本」来自不同快照（S45 对拍会红），
+        # 也会把 merge 重算 4 section × N 设备遍（2026-06-02 单日 1,712 行）。
         page_ctx = Ctx(date_key=ctx.date_key, con=ctx.con, devices=ctx.devices,
-                       structures=ctx.structures, slices=ctx.slices, device=dev)
+                       structures=ctx.structures, slices=ctx.slices, device=dev,
+                       _merged=ctx._merged, _link_index=ctx.link_index)
         html, n = mod.panel(pid, page_ctx, hidden=False)
         if n:
             rendered.append((pid, device_label(dev), html, n))
@@ -193,9 +198,21 @@ def _section(anchor: str, title: str, count_text: str, body: str, seg_html: str 
 _CACHE_DIR = Path(__file__).resolve().parents[1] / "tmp" / ".pagecache"
 
 
+# 渲染逻辑版本号：**改了任何 section 的输出形态就必须 +1**。
+# 片段缓存用输入指纹做键，而「渲染代码变了」不是输入 —— 不 bump 就会安静地
+# 复用旧片段，页面看起来"没生效"（2026-10-25 加定位条与子片展开时踩到风险点）。
+# v1 = 初始；v2 = 24 小时定位条 + 视觉子片递归展开 + 跨 section 标题统一；
+# v3 = link_index 改为「页面标题优先 + 同窗借标题并入索引」（web.py 不再自带降级分支）；
+# v4 = 定位条进目录浮钮（toc 新增 #hourbar 一项）；
+# v5 = B1（2026-10-25）：定位条改双轴按设备分行 + 桶聚合全量覆盖；视觉总结超长折叠。
+#      不 bump 会安静复用旧片段，页面看起来「没生效」（v3->v4 那次的风险点重演）。
+_RENDER_VERSION = 5
+
+
 def _fp(*parts) -> str:
-    """算输入指纹。任何影响该段输出的东西都要传进来。"""
+    """算输入指纹。任何影响该段输出的东西都要传进来（含渲染版本号）。"""
     h = hashlib.sha1()
+    parts = (_RENDER_VERSION,) + tuple(parts)
     for p in parts:
         h.update(repr(p).encode("utf-8", "replace"))
     return h.hexdigest()[:16]
@@ -301,19 +318,37 @@ def render_day(ctx: Ctx, counts: dict) -> tuple[str, list]:
             toc.append((vision.ANCHOR, vision.LABEL, "{:,}".format(vtotal)))
             _cache_put(ctx.date_key, vision.ANCHOR, _fp_vi, frag, vtotal)
 
+    # ---- 24 小时定位条（用户第 1 条诉求）
+    # 不吃片段缓存：它跨 section 聚合（时间线点 + 视觉点），任何一段变了它就得重算。
+    # 数量很小（实测 2026-08-13 共 126 点），重算成本远低于缓存维护成本。
+    hb = hourbar.render(ctx)
+    if hb:
+        # 定位条也进右下目录：页面很长，滚到中段时它是唯一的「回到找时间点」入口。
+        # 放在最前 —— 它是入口，不是第四个 section。
+        # 计数口径（S63）：定位条现在覆盖**全量**条目，所以目录里报的必须是
+        # 「全量条数」而不是「标记数」—— 报标记数会让人以为当天只有 100 条事件。
+        _n_hb = sum(len(v) for v in hourbar.rows_of_segment(ctx, "timeline").values())
+        _n_hb += sum(len(v) for v in hourbar.rows_of_segment(ctx, "vision").values())
+        toc.insert(0, (hourbar.ANCHOR, "24 小时", "{:,} 条".format(_n_hb)))
+
     weekday = _WEEK[datetime.strptime(ctx.date_key, "%Y-%m-%d").weekday()]
+    # 视觉统计口径 = **叶子片**（2026-10-25 同步修正）。
+    # 按片数算时父片没有 summary 会被计成「未完成」：2026-08-13 有 14 个父片，
+    # 页面会显示「61 / 75」，而实际上 61 个叶子片全部有总结 —— 数字自相矛盾。
+    _leaves = vision.leaves_of(ctx.all_slices()) if ctx.slices else []
+    _leaf_done = sum(1 for s in _leaves if s.get("summary"))
     stats = ('<p class="stats">'
              '<span><b>%s</b> 条原始事件</span>'
              '<span><b>%s</b> 次网页访问</span>'
              '<span>视觉 <b>%d / %d</b></span>'
              '</p>') % ("{:,}".format(counts["events"]), "{:,}".format(counts["web"]),
-                        counts["slices_done"], counts["slices"])
+                        _leaf_done, len(_leaves) or counts["slices"])
 
     if not body:
         body.append('<p class="empty">这一天没有任何设备使用记录。</p>')
 
     html = base.page(date_key=ctx.date_key, weekday=weekday, stats_html=stats,
-                     sections=toc, body="".join(body))
+                     sections=toc, body="".join(body), hourbar_html=hb)
     return html, toc
 
 
@@ -323,8 +358,12 @@ def build_day(con: sqlite3.Connection, date_key: str, out_root: Path | None = No
     html, toc = render_day(ctx, counts)
     target = (out_root or SLICE_ROOT) / (date_key + ".html")
     base.write(target, html)
+    # sections 只报**正文 section**（四个）。目录浮钮里还多一项 #hourbar，
+    # 但那是页面顶部的定位条、不是 section —— 把它算进去会让
+    # 「四个 <section>」这条验收口径（AGENTS.md §F.8）看起来变成五个。
     return {"path": target, "bytes": len(html.encode("utf-8")),
-            "sections": [t[0] for t in toc], "counts": counts}
+            "sections": [t[0] for t in toc if t[0] != hourbar.ANCHOR],
+            "counts": counts}
 
 
 def _days(con: sqlite3.Connection) -> list[str]:

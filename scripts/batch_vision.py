@@ -20,11 +20,11 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+# T1 (2026-10-25): sys.path.insert removed -- package is installable via pip install -e .
 
 from digitallife import paths  # noqa: E402
-from digitallife.schema_check import validate_structured  # noqa: E402
-from digitallife.vision import enhance_slice  # noqa: E402
+from digitallife.produce.schema_check import validate_structured
+from digitallife.produce.vision import enhance_slice
 
 _DEVICE = "pc"
 _READER = "model"
@@ -155,7 +155,7 @@ def _classify(err: str) -> str:
 def probe_quota() -> tuple[bool, str]:
     """发一个极小的纯文本请求探额度。返回 (是否可用, 错误)。"""
     try:
-        from digitallife.llm import ChatClient
+        from digitallife.produce.llm import ChatClient
         cli = ChatClient()
         cli.chat([{"role": "user", "content": "hi"}], max_tokens=8)
         return True, ""

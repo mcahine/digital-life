@@ -21,7 +21,7 @@ import sys
 import time
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+# T1 (2026-10-25): sys.path.insert removed -- package is installable via pip install -e .
 
 from digitallife import paths  # noqa: E402
 from digitallife.daily import build_daily  # noqa: E402
@@ -33,7 +33,11 @@ def _one(day: str) -> tuple[str, bool, str]:
     con.row_factory = sqlite3.Row
     try:
         con.execute("PRAGMA busy_timeout=30000")
-        # persist=False：批量重建只更新 vault 文件，不把渲染结果写回库。
+        # persist=False：**只算不落盘**。写 20-日报/*.md 的唯一入口是 publish_all，
+        # 本脚本仅用于「预热/校验渲染」，改完 daily.py 要看到 md 变化必须再跑 publish。
+        # （2026-10-25 修正：原文写的是「批量重建只更新 vault 文件」—— 那是假的，
+        #   _one() 里没有任何 write_bytes/write_text；正是这句半真半假的注释
+        #   让另一个 agent 以为跑本脚本就能重生成日报。）
         # 2026-10-24 用户裁决「日报不需要存储到数据库」—— 这里曾经用默认
         # persist=True，一次全量重建就把 5.9 MB output_text 又写回去了。
         build_daily(con, day, persist=False)

@@ -18,12 +18,12 @@ import time
 from datetime import datetime
 
 from . import paths
-from .clean import build_report
-from .store import (
+from .ingest.clean import build_report
+from .ingest.store import (
     count_events, count_kind, open_db, record_source_file,
     rebuild_fts, time_span, upsert_events,
 )
-from .tz import local_day, utc_ms_to_local
+from .ingest.tz import local_day, utc_ms_to_local
 
 
 def _run_id() -> str:
@@ -31,7 +31,7 @@ def _run_id() -> str:
 
 
 def _load_adapters(names: list[str]):
-    from .sources import ADAPTERS
+    from .ingest.sources import ADAPTERS
     if not names or names == ["all"]:
         names = list(ADAPTERS)
     missing = [n for n in names if n not in ADAPTERS]
@@ -78,7 +78,7 @@ def cmd_ingest(args: argparse.Namespace) -> int:
 
 
 def cmd_dbview(args: argparse.Namespace) -> int:
-    from .dbview import build_day_structure
+    from .domain.dbview import build_day_structure
     con = open_db()
     data = build_day_structure(con, args.date, args.device)
     print(json.dumps(data, ensure_ascii=False, indent=2)[:4000])
@@ -86,7 +86,7 @@ def cmd_dbview(args: argparse.Namespace) -> int:
 
 
 def cmd_slice(args: argparse.Namespace) -> int:
-    from .slicer import build_slices
+    from .domain.slicer import build_slices
     con = open_db()
     out = build_slices(con, args.device, args.date)
     con.commit()
@@ -96,7 +96,7 @@ def cmd_slice(args: argparse.Namespace) -> int:
 
 
 def cmd_vision(args: argparse.Namespace) -> int:
-    from .vision import enhance_slice
+    from .produce.vision import enhance_slice
     con = open_db()
     sql = "SELECT slice_id FROM slice WHERE status='pending'"
     argsq: list = []
@@ -122,7 +122,7 @@ def cmd_vision(args: argparse.Namespace) -> int:
 
 
 def cmd_ocr(args: argparse.Namespace) -> int:
-    from .ocr import available, ocr_image
+    from .produce.ocr import available, ocr_image
     if not available():
         raise SystemExit("本地 OCR 不可用：pip install -e .[ocr]")
     con = open_db()
@@ -187,7 +187,7 @@ def _device_choices() -> list[str]:
     不能写死成 ["pc", "phone"] —— 加第二台手机（phone-2）时那个 choices 会把
     合法值挡在 CLI 外面（DL-7 同类：设备扩容后硬编码清单静默失效）。
     """
-    from . import devices as _dv
+    from .domain import devices as _dv
     out: list[str] = []
     for d in _dv.all_devices():
         out.append(d.device_id)

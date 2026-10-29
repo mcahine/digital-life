@@ -2,12 +2,38 @@
 name = "digital-life"
 version = "0.1.0"
 requires-python = ">=3.11"
+description = "把电脑/手机使用痕迹加工成片层视觉总结与日层叙事（digital-life）"
 dependencies = [
   "httpx>=0.27",
 ]
 
 [project.optional-dependencies]
 ocr = ["pillow>=10.0", "rapidocr-onnxruntime>=1.4"]
+dev = ["pytest>=8.0"]
 
-[tool.uv]
-package = false
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+# T1（2026-10-25）：从「package = false」改为正常打包。
+# 目的：让 pip install -e . 成功、pytest 能收集、并删掉散落在 9 个脚本里的
+# sys.path.insert 兜底（它们的存在本身就是「无法安装」的症状，见 testing.md §4 阶段 0）。
+#
+# packages 只声明真实包：
+#   digitallife  —— 领域/加工/发布层
+#   slice_pages  —— 呈现层；物理位置在 scripts/slice_pages/，但要能 import slice_pages.x
+#                   （现有代码一律这么写，见 build_slice_html.py / smoke.py），故用 package-dir 映射。
+#                   ⚠️ 不要把它改成 digitallife.pages 之类的新路径 —— 那会同时改掉
+#                   10 个文件的 import 与 docs/spec/interfaces.md 的模块清单（N6 目录重构再统一做）。
+[tool.setuptools]
+packages = [
+    "digitallife",
+    "digitallife.ingest", "digitallife.ingest.sources",
+    "digitallife.domain", "digitallife.daily",
+    "digitallife.produce", "digitallife.produce.prompts",
+    "digitallife.emit", "digitallife.render",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"

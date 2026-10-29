@@ -15,10 +15,10 @@ import sqlite3
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+# T1 (2026-10-25): sys.path.insert removed -- package is installable via pip install -e .
 
 from digitallife import paths  # noqa: E402
-from digitallife.schema_check import validate_structured  # noqa: E402
+from digitallife.produce.schema_check import validate_structured
 
 
 def main() -> int:

@@ -27,13 +27,16 @@ import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT))
+# T1 (2026-10-25): sys.path.insert removed -- package is installable via pip install -e .
 
 
 def quality() -> tuple[int, int, int, int, int, int, int, int]:
     """返回 (done, total, bad, empty, three, with_desc, no_desc, days)。"""
     from digitallife import paths
-    from digitallife.vision import _collect_descriptions, _slice_events
+    # T3（2026-10-25）：原先是 from digitallife.vision import _collect_descriptions,
+    # _slice_events —— 运维脚本反向依赖加工层**私有符号**。私有符号改签名时无约束，
+    # 而本脚本是「一键收尾」的闸门，它静默算错会让闸门失效。改用公开 API。
+    from digitallife.produce.vision import slice_has_description
 
     con = sqlite3.connect(paths.db_path())
     con.row_factory = sqlite3.Row
@@ -58,7 +61,7 @@ def quality() -> tuple[int, int, int, int, int, int, int, int]:
     rows = con.execute("SELECT s.slice_id, s.image_count, s.start_utc_ms, s.end_utc_ms "
                        "FROM slice_result r JOIN slice s ON s.slice_id=r.slice_id "
                        "WHERE s.device='phone-2'").fetchall()
-    nd = sum(1 for r in rows if _collect_descriptions(_slice_events(con, r["slice_id"], r)))
+    nd = sum(1 for r in rows if slice_has_description(con, r["slice_id"], r))
     con.close()
     return done, total, bad, empty, three, nd, len(rows) - nd, days
 
