@@ -1,7 +1,7 @@
 # 数据源格式约定与设备标注
 
 > 读者：以后接入新数据源、或新增设备时的 AI 代理 / 我自己。
-> 真源：`digitallife/devices.py`（设备注册表）｜`digitallife/sources/*.py`（各源适配器）
+> 真源：`digitallife/domain/devices.py`（设备注册表）｜`digitallife/ingest/sources/*.py`（各源适配器）
 
 ---
 
@@ -27,16 +27,18 @@
 
 ### 注册表（唯一真源）
 
-`digitallife/devices.py`：
+`digitallife/domain/devices.py`：
 
-```python
-DEVICES = (
-    Device("pc-main", PC, "主力电脑", "当前唯一在用的 Windows 机器"),
-    Device("phone-1", PHONE, "手机 1", "ScreenMemo + IQQZ3 共用的那部"),
-)
-```
+> ⚠️ **本文不复制设备清单**（会漂移）。唯一真源是 `digitallife/domain/devices.py` 的 `DEVICES`，
+> 当前为 **三台**（一台 PC + 两台不同的手机）。要看清单请直接读代码或跑：
+>
+> ```bash
+> cd 01-Projects/digital-life && python -c "from digitallife import devices as d; [print(x.device_id, x.name, x.label) for x in d.all_devices()]"
+> ```
 
-**新增设备 = 这里加一行**，历史数据不受影响。
+**新增设备 = 在 `DEVICES` 里加一行**，历史数据不受影响。
+**两台手机 ≠ 一台**：`iQQQ Neo11`（ScreenMemo）与 `iQQQZ3`（IQQZ3）是不同设备，
+换设备归属会生成新 `event_id`，旧记录不会自动消失——重导后必须显式清理旧 `device` 的行，否则数量翻倍。
 
 ### 导入时决定归属
 
@@ -54,9 +56,18 @@ DL_DEVICE_MANICTIME=pc-work python -m digitallife.cli ingest --source manictime
 旧库里的 `pc` / `phone` 通过 `LEGACY_ALIASES` 自动解析到注册 id，**不需要迁移数据**：
 
 ```
-pc     -> pc-main     816,173 条（2026-10-22 实测）
-phone  -> phone-1     306,885 条（2026-10-22 实测）
+pc     -> pc-main
+phone  -> phone-1
 ```
+
+> **S45：旧别名各自的条数属于增长型指标，本文不写死。**
+> 需要条数时现查（采集日期随查询自带）：
+>
+> ```bash
+> cd 01-Projects/digital-life && python -c "import os;from digitallife.store import open_db;c=open_db();print(c.execute('SELECT device,COUNT(*) FROM event GROUP BY device').fetchall())"
+> ```
+>
+> 2026-10-25 实测的完整快照见 `04-Areas/数字人生/AGENTS.md` §B.1（带日期，非本文职责）。
 
 ### 查询时不能写 `device = ?`
 
@@ -78,15 +89,20 @@ vision×1 / publish×2），全部表现为「明明有数据却查不到」。
 
 - 某个设备在某 section **0 行时不生成该 tab**（实测「手机 0」点开只有一句空提示，纯噪音）。
 - 只有一个设备有内容时，整条 tab 控件不渲染。
-- 设备标签走 `contract.device_label()`：同类只有一台时显示「电脑 / 手机」，
-  多台时显示注册名（「主力电脑 / 手机 1」）。
+- 设备标签走 `contract.device_label()`，返回**真实设备名**（`D-001` / `iQQQZ3` / `iQQQ Neo11`）。
+  **不要退回「电脑 / 手机」**——用户 2026-10-22 明确否掉了那个写法。
+  （原文这里写的是「同类只有一台时显示电脑/手机」，与 `device_label()` 实现不符，2026-10-25 更正。）
 - 手机侧的 `timeline` 目前 `url` 恒为空（ScreenMemo/IQQZ3 不记 URL），
   所以手机时间线是**应用级**，页面上要写明这一点，不要让人误以为漏数据。
 
 ### 日报里的显示
 
 - 同类只有一台 → 沿用「电脑使用 / 手机使用」；
-- 同类有多台 → 自动带设备名（「主力电脑使用」「手机 2 使用」），否则读不出是哪台。
+- 同类有多台 → 用**真实设备名**（当前实测为 `## iQQQZ3 使用` / `## iQQQ Neo11 使用`）。
+
+> 原文此处写「主力电脑使用 / 手机 2 使用」（用的是 `label`），与代码不符：`daily._render_device`
+> 走的是 `devices.name_of()`。2026-10-25 更正。**权威定义见
+> `04-Areas/数字人生/AGENTS.md` §「日报结构契约」。**
 
 ---
 

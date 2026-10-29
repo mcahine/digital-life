@@ -12,7 +12,7 @@ IQQZ3 是 108 天 × 9 类 CSV，Tai 是 3 个 CSV，shion 是浏览器历史 SQ
 
 | 字段 | 语义 | 五源如何填 |
 |---|---|---|
-| `device` | 设备注册 id（`pc-main` / `phone-1`） | 源级常量；见 `digitallife/devices.py` |
+| `device` | 设备注册 id（`pc-main` / `phone-1`） | 源级常量；见 `digitallife/domain/devices.py` |
 | `source` | 五个源之一 | 源级常量 |
 | `kind` | app / web / screen / power / battery / notify / install | 见下表 |
 | `start_utc_ms` | 起点（UTC 毫秒，唯一主轴） | ManicTime 用 UtcTime 列；ScreenMemo/shion 是 epoch ms；IQQZ3/Tai 是本地串 → `tz.local_to_utc_ms` |
@@ -47,14 +47,20 @@ IQQZ3 是 108 天 × 9 类 CSV，Tai 是 3 个 CSV，shion 是浏览器历史 SQ
 理由：库 + NDJSON + 解包件合计约 1.2 GB，压在 vault 的 `_index/` 里会让 Obsidian 索引整个
 `04-Areas`（我的数据区）时扫进可重建的中间物，也让「我的数据」与「派生物」混在一棵树上。
 判定代码：`paths.INDEX_DIR`（vault 内）与 `paths.DATA_DIR`（`.data/`）。
-`.data/` 由根 `.gitignore` 的 `*.data` 规则排除（已 `git check-ignore -v` 反证）。
+`.data/` 由根 `.gitignore` 的**显式 `.data/` 规则**排除（2026-10-22 补写，已 `git check-ignore -v` 反证）。
+用 `git check-ignore -v -- .data/digital-life` 复核——**不要以为 `*.data` 那条二进制 glob 在管它**：
+`*.data` 的语义是「二进制模型文件」，它此前只是靠 `*` 能匹配空串侥幸命中（S54）。
 
 ## 2. 幂等的主键设计
 
 `event_id = sha1(device|source|kind|start_utc_ms|end_utc_ms|dedupe_key)`，其中 `dedupe_key`：
-- `screen` → path
+- `screen` → path（回退 title）
 - `web` → url（回退 title）
+- `battery` → app|title|**`payload.battery_pct`**（2026-10-23 补：漏电量会把「同秒同标题不同电量」的记录合并掉，实测丢 11,075 行）
+- `notify` → app|title|**`payload.count`**（同上：同一 App 同一天可能有多条不同计数，实测 244 组）
 - `app`/`power` → app|title（**标题参与**：同一应用的不同窗口是不同行为）
+
+> 实现真源：`digitallife/ingest/model.py` 的 `dedupe_key()`（分支数以此为准）。
 
 因此重复导入天然幂等（`ON CONFLICT(event_id) DO UPDATE`），不需要"先查再插"的竞态逻辑。
 副作用：`payload` 变化不会产生新行（payload 里只放可追溯信息，不放判定依据）。
@@ -120,7 +126,7 @@ ScreenMemo 自身单次请求实测带 13 张图（`segment_results.raw_request`
 #### 时间线为什么需要四层归并
 
 同一段行为会被多条时间线各记一次，用户 2026-10-22 明确要求「一个时间戳就够」。
-`digitallife/timeline_merge.py` 按四层处理，**缺任一层都会漏重复**：
+`digitallife/domain/timeline_merge.py` 按四层处理，**缺任一层都会漏重复**：
 
 | 层 | 判据 | 落点 |
 |---|---|---|

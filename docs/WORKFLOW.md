@@ -2,7 +2,7 @@
 
 > 读者：要改这个模块的人。本文只讲**数据怎么流动、每一步的输入输出与判定标准**，
 > 不讲踩坑史（那些在 `perf-regression-*` / `413-degenerate-image-*` 等复盘里）。
-> 规则条文在 `AGENTS.md §C`（十三条 DL），接口契约在 `docs/spec/interfaces.md`。
+> 规则条文在 `AGENTS.md §C`（DL 表，**条数以该文件为准，本文不抄写**），接口契约在 `docs/spec/interfaces.md`。
 
 ---
 

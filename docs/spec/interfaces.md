@@ -2,30 +2,50 @@
 
 > 本文件是并行开发的**唯一接口真源**。任何实现必须按此签名与数据形状落地；
 > 需要变更接口时先改本文件并通知所有写者，不得各自发明（S53：同一文件同一时刻只有一个写者）。
+>
+> **维护约定（2026-10-25 增补）**
+> - §0–§2 是**签名级契约**（函数名/参数/数据形状），代码与本文冲突时**以本文为准并改代码**；
+>   §3–§4 是并行期的**写者归属与编码约束**，写者早已收编，仅作历史留痕（新的写者协调走 S53）。
+> - §5 是**实施中被采纳的偏差**：这里的每一节都必须与当前代码一致。**不一致即为文档缺陷**，
+>   逐条对账与判决见同目录 `CONSISTENCY.md`。
+> - **日报结构**（有哪几个 `##`/`###`）不在本文件定义 —— 唯一权威定义在
+>   `04-Areas/数字人生/AGENTS.md` §「日报结构契约」。本文件只约束 `build_daily` 的签名与副作用。
 
 ## 0. 已实现（主代理所有，子代理只读，不得修改）
 
 | 文件 | 提供 |
 |---|---|
 | `digitallife/paths.py` | `PACKAGE PROJECT WORKSPACE AREAS INBOX VAULT INDEX_DIR DATA_DIR DAILY_DIR SLICE_DIR GTD_VAULT DIARY_DIR REVIEW_DIR`；`work_dir() db_path() manifest_path() clean_report_path() exports_dir() ensure_dirs()`（`DL_WORK_DIR`/`DL_DB` 可覆盖）。**`INDEX_DIR` 在 vault 内（只放 manifest），`DATA_DIR = WORKSPACE/.data/digital-life` 放库/NDJSON/work** |
-| `digitallife/devices.py` | `Device(device_id, kind, label, note)`；`DEVICES`（`pc-main`/`phone-1`）；`LEGACY_ALIASES`（旧 `pc`→`pc-main`、`phone`→`phone-1`）；`all_devices() get(id) kind_of(id) label_of(id) by_kind(kind) resolve_for_source(source) query_aliases(id) sql_device_filter(id)` |
-| `digitallife/schema_check.py` | `Verdict(ok, issues)`；`validate_structured(obj)`；`reason(verdict)`——R1–R9 校验 screenmemo-v1 结构 |
-| `digitallife/model.py` | `Event`（字段：device source kind start_utc_ms end_utc_ms app app_id title url path category payload；属性 `duration_s` `event_id` `dedupe_key()` `as_row()`）；`KINDS = ("app","web","screen","power","battery","notify","install")`；`SOURCES`；`DEVICES`（由 `devices.all_devices()` 派生，即 `pc-main`/`phone-1`）；`EVENT_COLUMNS` |
-| `digitallife/tz.py` | `LOCAL_TZ`(UTC+8) `local_to_utc_ms(dt)` `utc_ms_to_local(ms)` `local_day(ms)->"YYYY-MM-DD"` `parse_local(s)` `parse_flexible(s)` `parse_hms_to_seconds(s)` |
-| `digitallife/schema.py` | `SCHEMA_VERSION` `DDL` `init_db(con)`（已按 S30 先迁移后建索引） |
-| `digitallife/store.py` | `connect(path=None)` `open_db(path=None)` `upsert_events(con, events, ingest_run)` `record_source_file(con, **kw)` `count_events(con, source=None)` `count_kind(con, source)` `time_span(con, source=None)` `events_between(con, lo_ms, hi_ms, device=None, kinds=None)` `upsert_capture_text(con, event_id, text, engine, model, now_ms)` `search_events(con, q, limit=20)` `rebuild_fts(con)` |
-| `digitallife/clean.py` | `SourceReport`（`rows_read rows_kept dropped{} merged duplicated window_start_utc_ms window_end_utc_ms notes[]`；方法 `drop(reason,n=1) keep(n=1) as_dict()`）；`is_empty_event(ev)` `normalize_event(ev)` `merge_adjacent(events, gap_ms=120000, min_duration_s=30)`→`(list, merged, short_dropped)`；`build_report(reports)` |
-| `digitallife/sources/base.py` | `SourceAdapter`（属性 `name`/`device`/`root`；抽象 `fingerprint()->list[Fingerprint]` / `iter_events(report)->Iterator[Event]`；`run()->(fps, events, report)`）；`Fingerprint(source_id,path,sha256,bytes,mtime,note)`；`sha256_file(p)` |
-| `digitallife/sources/__init__.py` | `ADAPTERS: dict[str, type[SourceAdapter]]`（已 import 五个适配器模块，**适配器必须按下列类名实现**） |
+| `digitallife/domain/devices.py` | `Device(device_id, kind, label, note, name)`（`name` 为 2026-10-22 新增的真实设备名）；`DEVICES` = `pc-main`/`phone-1`/`phone-2` **三台**；`LEGACY_ALIASES`（旧 `pc`→`pc-main`、`phone`→`phone-1`）；`all_devices() get(id) name_of(id) kind_of(id) label_of(id) by_kind(kind) resolve_for_source(source) query_aliases(id) sql_device_filter(id)`。**本文不复制设备清单**——设备名的唯一真源是 `DEVICES` 本身（见 `CONSISTENCY.md` C-03） |
+| `digitallife/produce/schema_check.py` | `Verdict(ok, issues)`；`validate_structured(obj)`；`reason(verdict)`——R1–R9 校验 screenmemo-v1 结构 |
+| `digitallife/ingest/model.py` | `Event`（字段：device source kind start_utc_ms end_utc_ms app app_id title url path category payload；属性 `duration_s` `event_id` `dedupe_key()` `as_row()`）；`KINDS = ("app","web","screen","power","battery","notify","install")`；`SOURCES`；`DEVICES`（由 `devices.all_devices()` 派生，即 `pc-main`/`phone-1`）；`EVENT_COLUMNS` |
+| `digitallife/ingest/tz.py` | `LOCAL_TZ`(UTC+8) `local_to_utc_ms(dt)` `utc_ms_to_local(ms)` `local_day(ms)->"YYYY-MM-DD"` `parse_local(s)` `parse_flexible(s)` `parse_hms_to_seconds(s)` |
+| `digitallife/ingest/schema.py` | `SCHEMA_VERSION` `DDL` `init_db(con)`（已按 S30 先迁移后建索引） |
+| `digitallife/ingest/store.py` | `connect(path=None)` `open_db(path=None)` `upsert_events(con, events, ingest_run)` `record_source_file(con, **kw)` `count_events(con, source=None)` `count_kind(con, source)` `time_span(con, source=None)` `events_between(con, lo_ms, hi_ms, device=None, kinds=None)` `upsert_capture_text(con, event_id, text, engine, model, now_ms)` `search_events(con, q, limit=20)` `rebuild_fts(con)` |
+| `digitallife/ingest/clean.py` | `SourceReport`（`rows_read rows_kept dropped{} merged duplicated window_start_utc_ms window_end_utc_ms notes[]`；方法 `drop(reason,n=1) keep(n=1) as_dict()`）；`is_empty_event(ev)` `normalize_event(ev)` `merge_adjacent(events, gap_ms=120000, min_duration_s=30)`→`(list, merged, short_dropped)`；`build_report(reports)` |
+| `digitallife/ingest/sources/base.py` | `SourceAdapter`（属性 `name`/`device`/`root`；抽象 `fingerprint()->list[Fingerprint]` / `iter_events(report)->Iterator[Event]`；`run()->(fps, events, report)`）；`Fingerprint(source_id,path,sha256,bytes,mtime,note)`；`sha256_file(p)` |
+| `digitallife/ingest/sources/__init__.py` | `ADAPTERS: dict[str, type[SourceAdapter]]`（已 import 五个适配器模块，**适配器必须按下列类名实现**） |
 
 ## 1. 数据库表（schema.py 已建，可直接用）
 
 `source_file / event / capture_text / slice / slice_result / daily_summary` + FTS5 `event_fts / capture_fts / slice_fts`。
 新增列/表必须改 `schema.py` 的 `DDL` 并在 `MIGRATIONS` 登记（不要直接 exec ALTER）。
 
+**易错列名（2026-10-25 实测补录，全部以 `schema.py` 为真源）**：
+
+| 表 | 主键 | 易错点 |
+|---|---|---|
+| `event` | `event_id` | 时间列是 `start_utc_ms` / `end_utc_ms`（**不是** `start`/`end`）；`end_utc_ms` 可为 NULL |
+| `slice` | `slice_id` | `status` 恒为 `pending`/`split`，**不可用作选片判据** |
+| `slice_result` | `slice_id` | 结构化结果在 `structured_json`，另有 `app_timeline_json` / `raw_response` / `conflict_count` |
+| `daily_summary` | **`date_key`** | **不是 `date`**。写 `SELECT ... WHERE date = ?` 会报 `no such column: date` |
+| `source_file` | 自增 | 逐源清洗账在这里（`clean_report.json` 缺文件时以它为准） |
+
+> 查全表列名的最快方式：`python -c "import sqlite3;from digitallife import paths;c=sqlite3.connect(paths.db_path());print([r[1] for r in c.execute('PRAGMA table_info(daily_summary)')])"`
+
 ## 2. 待实现模块的**冻结签名**
 
-### 2.1 `digitallife/sources/manictime.py`
+### 2.1 `digitallife/ingest/sources/manictime.py`
 ```python
 class ManicTimeSource(SourceAdapter):
     name = "manictime"; device = "pc-main"      # 注册 id，非裸 pc
@@ -44,7 +64,7 @@ class ManicTimeSource(SourceAdapter):
 - 时间：用 `*UtcTime` 列（`tz.local_to_utc_ms` 只给无 UTC 列的源用）
 - 必须调用 `clean.merge_adjacent`（C4）再产出；丢弃计入 report
 
-### 2.2 `digitallife/sources/screenmemo.py`
+### 2.2 `digitallife/ingest/sources/screenmemo.py`
 ```python
 class ScreenMemoSource(SourceAdapter):
     name = "screenmemo"; device = "phone-1"    # 注册 id，非裸 phone
@@ -59,7 +79,7 @@ class ScreenMemoSource(SourceAdapter):
 - `segment_samples` **不单独产出事件**（与 shots 重复，C6）；只用于给 shots 反查 segment_id，放进 payload
 - **跳过**：`day_stats/totals/app_health_*/ai_*/search_docs/user_*/favorites/nsfw_*/mcp_*/app_stats/shard_registry/fts_registry/sqlite_sequence/android_metadata`（C7）
 
-### 2.3 `digitallife/sources/iqqz3.py`
+### 2.3 `digitallife/ingest/sources/iqqz3.py`
 ```python
 class Iqqz3Source(SourceAdapter):
     name = "iqqz3"; device = "phone-1"         # 注册 id，非裸 phone
@@ -74,7 +94,7 @@ class Iqqz3Source(SourceAdapter):
 - `AUM_V4_App_*.csv` → **不产事件**，产出 app_id→显示名映射（供 payload 归一，C11）
 - `AUM_V4_Place_/CheckDevice_/DailyUsage_` → 跳过（无可用记录）
 
-### 2.4 `digitallife/sources/tai.py`
+### 2.4 `digitallife/ingest/sources/tai.py`
 ```python
 class TaiSource(SourceAdapter):
     name = "tai"; device = "pc-main"           # 注册 id
@@ -86,7 +106,7 @@ class TaiSource(SourceAdapter):
 - 「每日」CSV 只用于交叉校验，不产事件（C8）
 - 时间列格式 `12/31/2024 16:00:00` → `tz.parse_flexible`
 
-### 2.5 `digitallife/sources/shion.py`
+### 2.5 `digitallife/ingest/sources/shion.py`
 ```python
 class ShionSource(SourceAdapter):
     name = "shion"; device = "pc-main"         # 注册 id
@@ -98,7 +118,7 @@ class ShionSource(SourceAdapter):
 - `domain` 表 → app_id 归一（domain.name）
 - `activity/moment/note/box/label/link/plan/program/remark/overview` 实测 **0 行**，跳过；若未来非空也要能容忍（用 `SELECT COUNT(*)` 判空后跳过）
 
-### 2.6 `digitallife/dbview.py`
+### 2.6 `digitallife/domain/dbview.py`
 ```python
 def build_day_structure(con, date_key: str, device: str | None = None) -> dict
 # 返回 {"date","apps":[{"app","app_id","seconds","sessions"}],
@@ -110,7 +130,7 @@ def build_day_structure(con, date_key: str, device: str | None = None) -> dict
 def write_app_timeline(con, slice_id: str, structure: dict) -> None   # 写 slice_result.app_timeline_json（无 result 行时先建骨架）
 ```
 
-### 2.7 `digitallife/slicer.py`
+### 2.7 `digitallife/domain/slicer.py`
 ```python
 WINDOW_MIN = 15; MAX_IMAGES = 24
 def build_slices(con, device: str, day_key: str | None = None) -> list[dict]
@@ -122,7 +142,7 @@ def build_slices(con, device: str, day_key: str | None = None) -> list[dict]
 def slice_events(con, slice_id: str) -> list[dict]   # 片内事件（供 vision 与 publish）
 ```
 
-### 2.8 `digitallife/llm.py`
+### 2.8 `digitallife/produce/llm.py`
 ```python
 class LLMError(RuntimeError): ...
 @dataclass class ChatConfig: base_url: str; api_key: str; model: str; timeout: float = 180.0
@@ -138,7 +158,7 @@ class ChatClient:
 # 硬约束：httpx.Client(trust_env=False)（S52）；非 200 抛 LLMError 带 status 与前 300 字
 ```
 
-### 2.9 `digitallife/ocr.py`
+### 2.9 `digitallife/produce/ocr.py`
 ```python
 def available() -> bool                       # 探测 rapidocr + PIL，缺依赖返回 False（不抛）
 def ocr_image(path: str | Path, max_side: int = 1280) -> str
@@ -146,7 +166,7 @@ def ocr_image(path: str | Path, max_side: int = 1280) -> str
 class OcrUnavailable(RuntimeError): ...
 ```
 
-### 2.10 `digitallife/prompts/segment.py`
+### 2.10 `digitallife/produce/prompts/segment.py`
 ```python
 PROMPT_VERSION = "screenmemo-v1"
 def build_prompt(slice_meta: dict) -> str
@@ -158,7 +178,7 @@ def build_prompt(slice_meta: dict) -> str
 #   以及本模块增补：「timeline[] 与 apps[] 的应用名与时间必须与随请求附带的 DB 结构一致」
 ```
 
-### 2.11 `digitallife/vision.py`
+### 2.11 `digitallife/produce/vision.py`
 ```python
 def enhance_slice(con, slice_id: str, client=None, reader: str = "model") -> dict
 # reader="model"：截图直接送模型；reader="local"：先 ocr 落 capture_text，再用纯文本请求结构化；
@@ -171,9 +191,10 @@ def enhance_slice(con, slice_id: str, client=None, reader: str = "model") -> dic
 # 幂等选片：pending_slice_ids 用 NOT EXISTS(slice_result)，并按 devices.sql_device_filter 过滤
 ```
 
-### 2.12 `digitallife/daily.py`
+### 2.12 `digitallife/daily/`
 ```python
-def build_daily(con, date_key: str, client=None) -> dict
+def build_daily(con, date_key: str, client=None, persist: bool = True) -> dict
+# persist=False：只算不写库（publish 走现算路径用；2026-10-24「日报不入库」改造增参，向后兼容）
 # 汇总当日：dbview.build_day_structure（pc+phone 各一份）+ 当日所有 slice_result.overall_summary
 # **日层正文由模型写**（`_llm_narrative` + `DAILY_PROMPT`：把当天所有片层总结按时间序整篇喂模型，
 # 要求自然段叙事、不用列表/时间轴、不省略、不编造）；模型不可用时才退回 `render_daily` 模板。
@@ -189,10 +210,12 @@ def build_daily(con, date_key: str, client=None) -> dict
 #      （保留兼容别名 _merge_browser_web / _span_seconds，smoke T14 直接 import 它们）
 ```
 
-### 2.13 `digitallife/publish.py`
+### 2.13 `digitallife/emit/publish.py`
 ```python
 def publish_all(con, day_keys: list[str] | None = None, make_zip: bool = True) -> dict
-# 写 VAULT/10-时段/YYYY-MM-DD/HHMM-HHMM.md（每片一篇，含 DB 时间线与 overall_summary）
+# 写 VAULT/10-时段/片层/YYYY-MM-DD/HHMM-HHMM.md（每片一篇，含 DB 时间线与 overall_summary）
+#   ← 2026-10-25 更正：旧契约写的是 10-时段/YYYY-MM-DD/HHMM-HHMM.md，那是「日期目录+9页」时代的布局；
+#     现片层一律落 paths.LAYERED_DIR（= 10-时段/片层/），与单日页 <日期>.html 互不干扰
 # 写 VAULT/20-日报/YYYY-MM-DD.md（机器总结，带 frontmatter {"date":..., "source":"digital-life"}）
 # 写 DATA_DIR/exports/digital-life-events.ndjson（全量 event 导出）
 # 写 INDEX_DIR/manifest.json：{"generated_at","counts":{...},"sources":[sha256/区间],"files":[sha256]}
@@ -211,8 +234,8 @@ def publish_all(con, day_keys: list[str] | None = None, make_zip: bool = True) -
 | D | daily.py publish.py | 子代理 D |
 | E | docs/spec/*.md README.md scripts/smoke.py cli.py | **主代理** |
 | F | devices.py schema_check.py timeline_merge.py scripts/{batch_vision,prune_results,rebuild_daily}.py | **主代理**（后续并入，无并行写者）|
-| G | scripts/slice_pages/{base,contract}.py + build_slice_html.py | **主代理**（公共底座 + 编排器）|
-| H | scripts/slice_pages/{apps,web,timeline,vision}_*.py | 页面作者（3 子代理并行，各写 4 页，互不越界）|
+| G | digitallife/render/{base,contract}.py + build_slice_html.py | **主代理**（公共底座 + 编排器）|
+| H | digitallife/render/{apps,web,timeline,vision}_*.py | 页面作者（3 子代理并行，各写 4 页，互不越界）|
 
 ## 4. 编码约束（全子代理适用）
 
@@ -243,17 +266,30 @@ def publish_all(con, day_keys: list[str] | None = None, make_zip: bool = True) -
 `OSError: [Errno 22]`。**约定**：stem 只用无冒号写法（`0900-1000`）。
 同一天 pc 与 phone 落在同一时段时，撞名才加 `-pc`/`-phone` 后缀；不撞名保持无后缀。
 
-### 5.3 日报形态（2026-10-22 已被叙事化取代）
+### 5.3 日报形态（**2026-10-25 重写，原描述与数据不符**）
 
-原契约要求 `## 电脑使用` / `## 手机使用` **恒出两节**。现行为：
+> 🔴 **原文错误**：本节曾写「`render_narrative` 只产 `## 今天`，**没有固定的电脑/手机两节**」。
+> 实测 753 篇日报中 `## 电脑使用` 出现 **752** 篇，设备节一直存在（见 `CONSISTENCY.md` C-01）。
+> 该描述已于 2026-10-25 作废。
 
-- **模型可用时**（正常路径）：`render_narrative` 产出 `# <date> 数字人生日报` + `## 今天` + 模型写的自然段，
-  末尾附一行「数据规模：…；完整时间线见时段网页」。**没有固定的电脑/手机两节**——
-  跨设备内容由模型在叙事里自行交代。
-- **模型不可用时**（降级路径）：退回 `render_daily` 模板，仍按设备分段。
+**现行为**（`daily.render_narrative`，实测）：
 
-不变量保留：设备标签用 `devices.name_of()`，直接显示真实设备名（`D-001` / `iQQQZ3`），
-多台时显示「主力电脑 / 手机 1」这类具体名字（见 data-sources.md §一）。
+1. 头部 frontmatter + `# <date> 数字人生日报` + 元信息行。
+2. `## 今天` —— 模型写的自然段叙事（`narrative` 为空时退化为一句设备/事件统计）。
+3. **每台当日有数据的设备一节** `## <标签> 使用`，节内按需产出
+   `### 应用（最突出的几个）` / `### 网站（最常去的）` / `### 专注段（同一应用 ≥15 分钟）` /
+   `### 时间线（重要事件）` / `### 离开时段`。**某节当日无数据时整节不出现**（这是当前 26 种结构模式的根因）。
+4. `## 展开看全量` + 一行指路 `10-时段/<日期>.html#vision`。
+
+**设备节标题的两条规则并存**（`daily._render_device`）：同类只有一台 → 用「电脑/手机」；
+同类**多台** → 用 `devices.name_of()` 的真实设备名。当前 `phone` 类两台，故为
+`## iQQQZ3 使用` / `## iQQQ Neo11 使用`；`pc` 类一台，故为 `## 电脑使用`。
+
+**降级路径已取消**：`render_daily`（`_render_key_actions` 罗列模板）已于 2026-10-24 停用，
+现仅为 `render_narrative` 的别名。
+
+**目标结构**（固定六个 `###`、设备节标题统一用真实名）见
+`04-Areas/数字人生/AGENTS.md` §「日报结构契约」——**本节不是权威定义，落地状态以那里为准**。
 
 ### 5.4 dbview 的 away 列表合并两类
 
@@ -308,14 +344,14 @@ smoke 的 T7 初版**没有判别力**：app 事件 09:00-11:00 与 Away 03:00-0
 
 | 路径 | 职责 | 写者 |
 |---|---|---|
-| `digitallife/timeline_merge.py` | 四层 timeline 归并（网页/路径孪生/同区间同义/同页回声） | 主代理 |
-| `scripts/slice_pages/base.py` | 设计 token + `page/esc/link/seg/more_button/card/fmt_dur/write` | 主代理 |
-| `scripts/slice_pages/contract.py` | `Ctx` / `load_slices` / `day_range_ms` / `device_label` | 主代理 |
+| `digitallife/domain/timeline_merge.py` | 四层 timeline 归并（网页/路径孪生/同区间同义/同页回声） | 主代理 |
+| `digitallife/render/base.py` | 设计 token + `page/esc/link/seg/more_button/card/fmt_dur/write` | 主代理 |
+| `digitallife/render/contract.py` | `Ctx` / `load_slices` / `day_range_ms` / `device_label` | 主代理 |
 | `scripts/build_slice_html.py` | 编排：装 Ctx、逐 section 渲染、设备 tab、目录锚点 | 主代理 |
-| `scripts/slice_pages/apps.py` | 应用 section | 页面作者 |
-| `scripts/slice_pages/web.py` | 网站访问 section | 页面作者 |
-| `scripts/slice_pages/timeline.py` | 时间线 section | 页面作者 |
-| `scripts/slice_pages/vision.py` | 视觉总结 section | 页面作者 |
+| `digitallife/render/apps.py` | 应用 section | 页面作者 |
+| `digitallife/render/web.py` | 网站访问 section | 页面作者 |
+| `digitallife/render/timeline.py` | 时间线 section | 页面作者 |
+| `digitallife/render/vision.py` | 视觉总结 section | 页面作者 |
 
 #### section 模块契约（新增 section 必须遵守）
 
@@ -333,7 +369,48 @@ def panel(pid, ctx: Ctx, *, hidden: bool = False):
 - `vision` 是**跨设备** section，签名不同：`panel(ctx) -> (html, 总片数, 已生成片数)`。
 - 编排器统一决定 section 顺序与目录锚点；**页面外壳（header / 右下浮钮 / 主题脚本）只在 `base.py`**。
 - **某设备在该 section 0 行时不要生成这个 tab** —— 由编排器过滤，模块只管如实返回行数。
-- **不要自己写 CSS**：`base.CSS` 已定义 `.section/.section-head/.seg/.panel/.tw/table/.num/.ttl/ul.sub/.sites/.site/.visit/.more/.card/.empty/.dock/.jump/.fab/.bar`。
+- **不要自己写 CSS**：`base.CSS` 已定义下列类；新增 section 只能用这些，或先在 `base.py` 补 token。
+
+```text
+# 布局与外壳
+.section .section-head .seg .panel .tw table .num .ttl .bar
+.dock .jump .fab .empty .more
+
+# 时间线 / 子行
+ul.sub .ev .ev.major .t
+
+# 网站段
+.sites .site .site-name .site-figs .site-meta .site-dur .chev .visits .visit .vt .vd
+
+# 卡片（视觉段）
+.card .lead .vnode .vnode.leaf .vnode.split
+
+# 24 小时定位条（2026-10-25 第 1 轮：单轨）
+.hourbar .hb-top .hb-title .hb-legend .hb-legend2 .hb-dot .hb-dot.tl .hb-dot.vi
+.hb-track .hb-tick .hb-lab .hb-p .hb-p.tl .hb-p.vi
+
+# 24 小时定位条（2026-10-25 第 2 轮：双轴 × 每设备一行，见 N2/N3/N4）
+.hourbar .hb-top .hb-title .hb-legend .hb-legend2 .hb-dot .hb-dot.tl .hb-dot.vi
+.hb-note .hb-note b
+.hb-axis .hb-axis-head .hb-axis-n      # 两条轴（data-seg=timeline / vision）
+.hb-rows .hb-row .hb-row-dev .hb-lane  # 轴内每设备一行
+.hb-scale .hb-scale-in .hb-tick .hb-lab # 0-24 刻度
+.hb-b .hb-b.tl .hb-b.vi                # 聚合桶（title 写条数，data-c 写 count）
+.hb-p .hb-p.tl .hb-p.vi                # 单点（<=200 时逐点画）
+
+# 视觉总结折叠（2026-10-25 第 2 轮：N1）
+.vs-fold .vs-fold-body .vs-words
+```
+
+> **2026-10-25 复核**（原 §5.8 只列到 `.bar`，未含 `hourbar`/`vnode`）：新增的 24 小时定位条与
+> 子片正文渲染带入了上面第三组的类。**新增类必须先加进 `base.CSS` 再在此登记**，否则下一个人
+> 会以为可以自由造类名，造成样式漂移。
+
+> **2026-10-25 第 2 轮登记（N1/N2/N3/N4）**：定位条重设计为「两条轴 × 每设备一行」，
+> 折叠用原生 `<details class="vs-fold">`。上表第 4/5 组即实装类名（已核对 `base.CSS`
+> 真实存在，不是设计稿）。
+> **`.hb-track` 是第 1 轮单轨实现的遗留类**：第 2 轮改用 `.hb-lane`（每设备一条跑道）
+> 后它不再被生成，但 CSS 保留（避免旧的 3 个历史页面样式崩掉）。新增页面不得再用它。
 
 #### Ctx 与 slice 形状（实测可用）
 

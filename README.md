@@ -47,7 +47,7 @@
 | shion | pc-main | 浏览器历史 | 2024-09…2025-03 |
 
 > tai 与 shion 有 6,214 条交集，**跨源归并后恰好 33,967**。
-> 设备 id 用注册表（`digitallife/devices.py`），旧值 `pc`/`phone` 经 `LEGACY_ALIASES` 只读兼容。
+> 设备 id 用注册表（`digitallife/domain/devices.py`），旧值 `pc`/`phone` 经 `LEGACY_ALIASES` 只读兼容。
 
 ## 常用命令
 
