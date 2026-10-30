@@ -93,12 +93,13 @@ def _llm_narrative(client, date_key: str, breakdown: dict,
                   "不要编造、不要写任何以 # 开头的行）：\n"
                   + json.dumps(facts, ensure_ascii=False))
 
-    # 预算不是安全带，是步长（DL-12）。2026-10-30 实测同一段 3,140 token 原料：
-    #   max_tokens=8192 -> 58.1s，推理 1,790 token，输出 1,110 字
-    #   max_tokens=2048 -> 32.1s，推理   383 token，输出 1,159 字
-    # 降预算后**更快且输出更多**——推理 token 吃掉的时间不会变成正文。
-    # 故默认 2048；DL_LLM_DAILY_MAX_TOKENS 可覆盖（截断时调大）。
-    _budget = int(os.environ.get("DL_LLM_DAILY_MAX_TOKENS") or 2048)
+    # 预算不是安全带，是步长（DL-12）。但**降到 2048 是错的**（2026-10-30 实测）：
+    #   小 prompt（3,140 token）下 2048 确实更快更多；
+    #   真实日报原料平均 8,835 字（约 5,000 token）+ 需要 1,600-5,000 字输出，
+    #   2048 预算下实测：一天只出 205 字、另一天直接空（推理把预算吃光）。
+    # 故默认回到 8192（原值），仅保留环境变量覆盖能力。
+    # 想省钱时按日调小，但**必须先抽查输出字数**，别拿空叙事换速度。
+    _budget = int(os.environ.get("DL_LLM_DAILY_MAX_TOKENS") or 8192)
     try:
         resp = client.chat([{"role": "user", "content": prompt}], max_tokens=_budget)
     except Exception:  # noqa: BLE001 —— 模型故障不阻塞日报
