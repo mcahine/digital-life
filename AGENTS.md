@@ -4,7 +4,7 @@
 > **边界**：本文件只写「工程怎么做才不闯祸」。数据现状、口径、契约归 `../../04-Areas/数字人生/AGENTS.md`；
 > 设计意图归 `docs/spec/design.md`；接口签名归 `docs/spec/interfaces.md`；任务状态归 `docs/spec/tasks.md`；
 > 文档索引见 `docs/README.md`。
-> **接手本模块**：先读 `docs/HANDOFF-2026-10-25.md`（交接文档，唯一入口：现状真值 + SDCA 七步 + T1–T5 任务切分）。
+> **接手本模块**：先读 `docs/HANDOFF.md`（交接文档，唯一入口：一屏速览 + 依据层 + 待办清单 + 自纠教训）。
 > **通用卡点（CP-1…CP-6）与防错标准（S1–S59）**：见工作区根 `AGENTS.md` —— **只引用，不复制**。
 
 ---

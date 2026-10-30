@@ -13,7 +13,7 @@
 docs/
 ├── README.md              ← 本文件（索引，唯一入口）
 ├── WORKFLOW.md            数据怎么流动（五阶段总览）
-├── HANDOFF-2026-10-25.md  ★★ 交接文档（可交付工程化，SDCA 七步 + KPI 任务切分）
+├── HANDOFF.md            ★★ 交接文档（唯一入口）
 ├── HANDOFF.md             2026-10-23 那次交接的历史快照（内含失效链接）
 ├── phone-vision-runbook.md      phone-2 视觉长跑的运行手册
 ├── phone-vision-report-template.md  长跑收尾报告的填空模板
@@ -31,8 +31,6 @@ docs/
 |---|---|---|---|
 | [README.md](README.md) | 文档在哪、哪份还能信 | 所有人（入口） | 2026-10-25 · 本文件 |
 | [WORKFLOW.md](WORKFLOW.md) | 数据从源文件到 vault 的五个阶段、每步输入输出与判定标准 | 要改管线的人 | 🟡 2026-10-25 核实：五阶段描述仍成立；**但第 5 行写「§C 十三条 DL」已过期（现为 16 条）**，应改为「见 AGENTS.md §C」不写条数 |
-| [HANDOFF-2026-10-25.md](HANDOFF-2026-10-25.md) | **接手 digital-life 该从哪看起**：现状真值、SDCA 七步、T1–T5 任务切分与出口判据、KPT 复盘、交接清单 | **下一手（第一读者）** | 2026-10-25 · 新建。**本文件是交接的唯一入口**，全文 62 项自检通过 |
-| [HANDOFF.md](HANDOFF.md) | 2026-10-23 那次交接时视觉收尾做到哪、还剩什么 | 接手当次任务的人 | 🔴 2026-10-25 核实：**结论已过期**（「待做 0」当时成立，但内文指向的 `FINAL-2026-10-23.md` **根本不存在**，是死链）。该改：要么补该文件，要么把链接换成 `postmortem/2026-10-23-delivery.md`；并把「当前状态」改成「历史快照」。**2026-10-25 已加历史快照横幅；现行交接见 HANDOFF-2026-10-25.md** |
 | [phone-vision-runbook.md](phone-vision-runbook.md) | phone-2 那 5,940 片怎么跑、闸门是什么、性能口径多少 | 要重跑 phone-2 视觉的人 | 🟢 2026-10-25 核实：5,940/5,940 与库内一致；命令可跑 |
 | [phone-vision-report-template.md](phone-vision-report-template.md) | 长跑收尾报告长什么样、要填哪些数 | 写收尾报告的人 | 🟢 2026-10-25 核实：纯模板，不含时效性断言（`{{...}}` 占位符）。依赖 `tmp/monitor.py` 产物，该脚本不在版本控制内 |
 | [architecture/layering.md](architecture/layering.md) | 分层现状、边界泄漏在哪、模块该怎么拆 | 做架构改造的人 | 🟡 2026-10-25 新建（子代理3），**仍在产出中**；§3「拆分方案」里的目标文件**尚未创建**，读时按「计划中」对待 |
