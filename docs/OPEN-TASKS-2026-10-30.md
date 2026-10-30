@@ -189,3 +189,74 @@ python tmp/todo_verify.py    # 抽样回验红绿
 | W5 | `docs/architecture/t5-tmp-governance-plan.md`、`python tmp/todo_probe.py` D 段 |
 | R1 / R2 | `python tmp/todo_verify.py` R 段 |
 | D1–D5 | `docs/HANDOFF-2026-10-25.md` §6.3 / §9.1 / §11 |
+---
+
+## 七、成本项的两个前置阻塞（2026-10-30 实测发现）
+
+### 阻塞 1：成本项① 卡在「代码里没接模型」
+
+**事实**（可复现）：
+
+```
+daily_summary 753 行 -> 有叙事 1 行（2026-08-13，9,331 字），其余 752 行为空
+
+build_daily(con, date_key, client=None, ...)
+  关键分支：if client is not None and have_dev:
+  没有 client -> 不生成叙事 -> narrative 留空
+
+调用方全都没传 client：
+  digitallife/cli.py:155        build_daily(con, args.date)          <- 无 client
+  scripts/rebuild_daily.py      build_daily(con, day, persist=False)  <- 无 client
+
+全库 ChatClient 实例化 5 处：vision.py / batch_vision.py /
+rewrite_st​yle.py / smoke.py x2  —— 没有一处是给 daily 用的
+```
+
+**结论：不是「没跑」，是「代码路径上没接上」。**
+
+要跑 142 天叙事，必须先做两件事：
+
+| 步 | 工作 | 性质 | 状态 |
+|---|---|---|---|
+| 1 | 给 `rebuild_daily.py` 加 `--llm` 参数，构造 `ChatClient` 并传入 `build_daily` | 改生产代码约 30 行 | **待做** |
+| 2 | 配 `DL_LLM_BASE_URL` / `DL_LLM_API_KEY` / `DL_LLM_MODEL` | 需要用户提供凭据 | **等用户** |
+
+### 阻塞 2：成本项② 的真实规模比文档大得多
+
+| 项 | 文档 | 实测 | 差异 |
+|---|---|---|---|
+| URL 缺口 | 44,469 | **49,580** | 多 5,111 |
+| 耗时 | 6–8 小时 | **约 18.4 小时** | 慢 2–3 倍 |
+| 根因 | — | bilibili 占 52%（25,932 个），实测 3/3 全失败且每个耗 5.6–11.9 秒 | — |
+
+**已设计但未实施的优化**（用户已批准改 `fetch_titles.py`）：
+
+```
+① 原始缺口              49,580
+② 跳过畸形 URL          -2
+③ URL 规范化去重        -8,600   （spm_id_from/vd_source 等追踪参数）
+④ URL 自解释免抓        -2,144   （search.bilibili?keyword=X -> 标题就是 X）
+   ────────────────────────────
+   真正需联网            38,834    ->  约 14.4 小时（省 21.7%）
+```
+
+另有待诊断项：bilibili 为何 100% 失败（用户选择了「先诊断再决定」）。
+
+### 成本项① 的规模修正（同样重要）
+
+| 项 | 文档 | 实测 |
+|---|---|---|
+| 要跑的天数 | 753 | **142**（其余 608 天没有片总结，喂空原料无意义） |
+| 调用次数 | 143 | **142**（一致） |
+| 原料字数 | 577 万 | **约 125 万**（差 4.6 倍） |
+
+### 留坑：dsh-bridge 接入（用户明确「等以后再填」）
+
+用户 2026-10-30 决策：
+- dsh-bridge **需要重构**，现有四条通道与 104 个模型**都别用**
+- 已让 dsh-bridge 自己写独立化要求文档：`01-Projects/dsh-bridge/docs/INDEPENDENCE-REQUIREMENTS.md`
+- 用户将提供 `URL + key + 模型名`
+- **数字人生暂不接 dsh-bridge**：`digitallife/produce/llm.py` 的 `ChatConfig` 已经是标准 OpenAI 形态，
+  拿到 URL+key+model 直接用即可，不必为了「经过 bridge」多一层间接
+
+**这个坑什么时候填**：等 dsh-bridge 独立化完成（其文档 R1–R6 六步），或用户直接给凭据。
