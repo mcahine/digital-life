@@ -260,3 +260,126 @@ rewrite_st​yle.py / smoke.py x2  —— 没有一处是给 daily 用的
   拿到 URL+key+model 直接用即可，不必为了「经过 bridge」多一层间接
 
 **这个坑什么时候填**：等 dsh-bridge 独立化完成（其文档 R1–R6 六步），或用户直接给凭据。
+
+---
+
+## 八、模型接入与两项成本任务（2026-10-30 执行记录）
+
+### 8.1 凭据探活
+
+用户提供 `https://token.sensenova.cn/v1/chat/completions` + `sensenova-6.8-flash-lite`。
+
+```
+探活: 7.12s，回复「连通正常」，usage prompt=134 completion=83 (reasoning=79)
+```
+
+推理 token 占 95% —— 与本项目 DL-12 记录一致。
+
+### 8.2 修掉的真实缺陷：日报从来没接上模型
+
+改前状态：
+
+```
+daily_summary 753 行 -> 有叙事 1 行（仅 2026-08-13），其余 752 行 narrative 为空
+
+build_daily(con, date_key, client=None, ...)
+  关键分支：if client is not None and have_dev:
+  没有 client -> 不生成叙事
+
+调用方全都没传 client：
+  digitallife/cli.py:155        build_daily(con, args.date)           <- 无 client
+  scripts/rebuild_daily.py      build_daily(con, day, persist=False)  <- 无 client
+
+全库 ChatClient 实例化 5 处：vision.py / batch_vision.py /
+rewrite_style.py / smoke.py x2 —— 没有一处给 daily 用
+```
+
+结论：**不是「没跑」，是代码路径上没接上。**
+
+改动 `scripts/rebuild_daily.py`：新增 `_make_client()`（按环境变量在子进程内重建，
+因为 ChatClient 持有 httpx 连接池不可 pickle），加 CLI 参数 `--llm` 与 `--only-missing`。
+
+### 8.3 端到端验证
+
+| 日期 | 原料字数 | 改前 | 改后 |
+|---|---|---|---|
+| 2026-05-30 | 16,005 | narrative 长度 **0** | phone-2 **2,502 字**，316s |
+| 2026-06-03 | 31,237（最大） | narrative 长度 **0** | phone-2 **5,074 字**，160s |
+
+抽 2026-06-03 开头（证明是真实叙事）：
+
+> 凌晨两点五十三分，iQQQ Neo11 还亮着屏幕，用户正在 DeepSeek 里发起一场关于经济发展矛盾的哲学讨论。
+> AI 从辩证法角度分析了经济发展必然产生的代价与限制、环境保护与社会公平之间的对立统一关系。
+
+### 8.4 效率优化一：max_tokens 8192 -> 2048（省 45%）
+
+实测同一段 3,140 token 原料：
+
+| max_tokens | 耗时 | 推理 token | 输出字数 |
+|---|---|---|---|
+| 8192 | 58.1s | 1,790 | 1,110 字 |
+| **2048** | **32.1s** | **383** | **1,159 字** |
+
+**降预算后更快且输出更多** —— 推理 token 吃掉的时间不会变成正文（DL-12 同一规律）。
+
+改动：`digitallife/daily/prompt.py:95` 固定 8192 → 可配置默认 2048（`DL_LLM_DAILY_MAX_TOKENS`）。
+
+### 8.5 效率优化二：bilibili 全部可抓（原本 100% 失败）
+
+**本轮最有价值的发现**。原判断是「bilibili 占缺口 52% 且 100% 失败，建议跳过」。
+诊断后发现根本不该跳过：
+
+```
+同一 URL、同一 UA，只换 HTTP 库：
+  urllib  -> 352,359 B，返回简化页，取不到 <title>   （项目原实现）
+  httpx   -> 2,353,573 B，title 正常                 （换掉之后）
+```
+
+**差别在 HTTP 实现自身（连接/头/压缩协商），不是 UA。**
+
+改动 `digitallife/render/linktitle.py` 的 `fetch()`：urllib → httpx（已是项目依赖）。
+
+```
+改前 0/3 全失败  ->  改后 3/3 全成功，且更快（4-5s vs 5.6-11.9s）
+```
+
+这一改直接保住 **25,932 个 bilibili 标题**，不必放弃。
+
+### 8.6 效率优化三：URL 规范化去重（省 16.3%）
+
+改动 `scripts/fetch_titles.py`：新增 `canon_url()`，去掉 `spm_id_from` / `vd_source` 等 26 个
+纯追踪参数，同一页面的不同变体只抓一次。
+
+```
+规范化去重：44,469 个 URL 合并为 37,204 次抓取（省 7,265 次）
+```
+
+**落库仍按原始 URL 逐个写**——规范化只用于抓取队列去重，当落库键会让渲染侧匹配不上。
+
+### 8.7 试抓验证
+
+```
+python scripts/fetch_titles.py --limit 40 --workers 6 --timeout 10
+完成：成功 27 / 失败 13，耗时 0.8 分钟；成功率 67.5%
+```
+
+**67.5% 远高于文档估计的 56%**，且是修好 httpx 之后。
+
+### 8.8 成本重估
+
+| 项 | 优化前 | 优化后 |
+|---|---|---|
+| 日报叙事 | 753 天 / 无可用入口 | **143 次调用** |
+| 单次耗时 | 316s | **60–160s** |
+| 总耗时 | 12.6h 串行 | **约 2–3h**（4 并发）|
+| URL 缺口 | 44,469 | **37,204** |
+| URL 成功率 | 约 56%（估计）| **67.5%**（实测）|
+| URL 总耗时 | 18.4h | 约 10h |
+
+### 8.9 回归
+
+```
+pytest              -> 34 passed
+smoke               -> 通过 213 / 失败 0
+verify_vault --fast -> 主代理终验: 通过 12 / 失败 0
+```

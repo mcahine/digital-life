@@ -198,27 +198,38 @@ def save(con: sqlite3.Connection, url: str, title: str, *, source: str = "http",
 
 # ---------------------------------------------------------------- 抓取（仅 fetch_titles.py 调）
 
+# 真实浏览器 UA。2026-10-30 实测：bilibili 对非浏览器 UA 会返回精简页。
+_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+       "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+
+
 def fetch(url: str, timeout: float = 6.0) -> str:
-    """联网抓 <title>。失败返回空串，绝不抛异常（建页/批处理不能因网络失败）。"""
+    """联网抓 <title>。失败返回空串，绝不抛异常（建页/批处理不能因网络失败）。
+
+    **为什么用 httpx 而不是 urllib**（2026-10-30 实测，同 UA 同 URL）：
+        urllib  -> 352,359 B，返回简化页，**取不到 <title>**
+        httpx   -> 2,353,573 B，title 正常
+    差别在 HTTP 实现自身（连接/头/压缩协商），不是 UA。
+    实测 bilibili 占待抓缺口的 52%（25,932 个），用 urllib 时 100% 失败，
+    换 httpx 后能抓回来 —— 这比「跳过 bilibili」多保住 2.6 万个标题。
+    httpx 本就是项目依赖（pyproject.toml: httpx>=0.27），无新增成本。
+    """
     u = str(url or "").strip()
     if not u.startswith(("http://", "https://")):
         return ""
     try:
-        req = urllib.request.Request(u, headers={
-            "User-Agent": "Mozilla/5.0 (compatible; digital-life/1.0)",
-        })
-        with urllib.request.urlopen(req, timeout=timeout) as r:
-            raw = r.read(200_000)
-        charset = "utf-8"
-        m = re.search(rb'charset=["\']?([\w-]+)', raw[:2000], re.I)
-        if m:
-            charset = m.group(1).decode("ascii", "ignore")
-        html = raw.decode(charset, "replace")
+        import httpx
+
+        r = httpx.get(u, headers={"User-Agent": _UA},
+                      timeout=timeout, follow_redirects=True)
+        if r.status_code >= 400:
+            return ""
+        html = r.text
         m = re.search(r"<title[^>]*>(.*?)</title>", html, re.S | re.I)
         if not m:
             return ""
         return re.sub(r"\s+", " ", m.group(1)).strip()[:300]
-    except Exception:
+    except Exception:  # noqa: BLE001 —— 网络失败不阻塞调用方
         return ""
 
 

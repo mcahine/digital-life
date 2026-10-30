@@ -53,6 +53,38 @@ def open_db() -> sqlite3.Connection:
     return con
 
 
+# 纯追踪参数：去掉后仍指向同一页面，不影响落地内容。
+# 2026-10-30 实测：49,580 个待抓 URL 里，仅靠规范化就能合并掉 8,600 个（17.3%）。
+_TRACK_PARAMS = frozenset({
+    "spm_id_from", "vd_source", "from_source", "share_source", "share_medium",
+    "bbid", "seid", "spm", "tab", "ts",
+    "utm_source", "utm_medium", "utm_campaign", "utm_term", "utm_content", "utm_id",
+    "sca_esv", "sxsrf", "ved", "ei", "uact", "oq", "gs_lp", "sclient", "biw", "bih",
+})
+
+
+def canon_url(u: str) -> str:
+    """URL 规范化：去掉追踪参数、去尾斜杠、去 fragment。失败返回原串。
+
+    **不能把规范化后的 URL 当落库键**：页面链接用的是原始 URL，
+    改了键渲染时就匹配不上。这里的用途只有一个 —— 让「同一页面的不同追踪变体」
+    在抓取队列里只出现一次，抓回来的标题按原始 URL 逐个落库。
+    """
+    raw = str(u or "").strip()
+    try:
+        from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+
+        p = urlsplit(raw)
+        if not p.netloc:
+            return raw
+        q = [(k, v) for k, v in parse_qsl(p.query, keep_blank_values=True)
+             if k.lower() not in _TRACK_PARAMS]
+        return urlunsplit((p.scheme, p.netloc, (p.path or "").rstrip("/"),
+                           urlencode(q), ""))
+    except Exception:  # noqa: BLE001 —— 畸形 URL 原样返回，由 fetch 去拒
+        return raw
+
+
 def collect(con: sqlite3.Connection, retry_failed: bool = False) -> list[tuple[str, str]]:
     """返回 [(url, 原 title)]，只含「title 是域名形态且库里没有可用标题」的。
 
@@ -97,7 +129,25 @@ def collect(con: sqlite3.Connection, retry_failed: bool = False) -> list[tuple[s
             if st == "failed" and not retry_failed:
                 continue      # 上次已判定抓不到，不重复打扰
         seen[u] = t
-    return list(seen.items())
+
+    # 规范化去重（2026-10-30）：同一页面的不同追踪变体只抓一次。
+    # 实测 bilibili 占缺口 52%，其 URL 大量带 spm_id_from / vd_source 等参数，
+    # 同一个视频会以 3-5 个变体各抓一遍 —— 规范化后只抓一次。
+    # 落库仍按原始 URL 逐个写（见 one()），保证渲染侧能按页面链接匹配。
+    groups: dict[str, list[str]] = {}
+    for u in seen:
+        groups.setdefault(canon_url(u), []).append(u)
+
+    out: list[tuple[str, str]] = []
+    merged = 0
+    for _c, members in groups.items():
+        members.sort()
+        out.append((members[0], seen[members[0]]))
+        merged += len(members) - 1
+    if merged:
+        print("  规范化去重：%d 个 URL 合并为 %d 次抓取（省 %d 次）"
+              % (len(seen), len(out), merged), flush=True)
+    return out
 
 
 def stat(con: sqlite3.Connection) -> dict:

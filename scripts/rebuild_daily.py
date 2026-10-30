@@ -27,7 +27,32 @@ from digitallife import paths  # noqa: E402
 from digitallife.daily import build_daily  # noqa: E402
 
 
-def _one(day: str) -> tuple[str, bool, str]:
+def _make_client():
+    """按环境变量构造 ChatClient；未配置则返回 None（= 不生成叙事）。
+
+    为什么在子进程里重建而不是把 client 传进来：ProcessPoolExecutor 要 pickle 参数，
+    ChatClient 持有 httpx 连接池，不可 pickle。故用环境变量做跨进程传递。
+
+    2026-10-30 新增：在此之前**没有任何入口给 build_daily 注入 client**，
+    导致 753 天日报里只有 1 天有叙事（其余 752 天 narrative 为空）——
+    不是「没跑」，是代码路径上没接上。
+    """
+    base = (os.environ.get("DL_LLM_BASE_URL") or "").strip()
+    key = (os.environ.get("DL_LLM_API_KEY") or "").strip()
+    model = (os.environ.get("DL_LLM_MODEL") or "").strip()
+    if not (base and key and model):
+        return None
+    from digitallife.produce.llm import ChatClient, ChatConfig
+
+    return ChatClient(ChatConfig(
+        base_url=base,
+        api_key=key,
+        model=model,
+        timeout=float(os.environ.get("DL_LLM_TIMEOUT") or 240),
+    ))
+
+
+def _one(day: str, persist: bool = False) -> tuple[str, bool, str]:
     """重建一天并提交。返回 (日期, 是否成功, 失败原因)。必须是模块级函数才可 pickle。"""
     con = sqlite3.connect(paths.db_path(), timeout=30, check_same_thread=False)
     con.row_factory = sqlite3.Row
@@ -40,7 +65,7 @@ def _one(day: str) -> tuple[str, bool, str]:
         #   让另一个 agent 以为跑本脚本就能重生成日报。）
         # 2026-10-24 用户裁决「日报不需要存储到数据库」—— 这里曾经用默认
         # persist=True，一次全量重建就把 5.9 MB output_text 又写回去了。
-        build_daily(con, day, persist=False)
+        build_daily(con, day, client=_make_client(), persist=persist)
         con.commit()
         return (day, True, "")
     except Exception as exc:  # noqa: BLE001
@@ -48,6 +73,49 @@ def _one(day: str) -> tuple[str, bool, str]:
         return (day, False, "%s: %s" % (type(exc).__name__, str(exc)[:90]))
     finally:
         con.close()
+
+
+def _filter_missing_narrative(days: list[str]) -> list[str]:
+    """只保留「有片总结 但 缺叙事」的天。
+
+    为什么需要：753 天里有片总结的只有 143 天，其余 608 天没有原料，
+    喂空给模型既费钱又没意义。2026-10-30 实测：
+    有片的天 751 / 有片且有总结的天 143 / 缺叙事且能跑的天 142。
+    """
+    import json as _json
+
+    import datetime as _dt
+
+    con = sqlite3.connect(paths.db_path())
+    con.row_factory = sqlite3.Row
+    try:
+        # 有片总结的天。slice 表**没有 date_key 列**（实测），
+        # 只能从 start_utc_ms 转本地日（UTC+8）作为归日口径。
+        have_sum = set()
+        for r in con.execute(
+            "SELECT DISTINCT start_utc_ms FROM slice WHERE slice_id IN "
+            "(SELECT slice_id FROM slice_result)"
+        ):
+            d = (_dt.datetime.utcfromtimestamp(int(r["start_utc_ms"]) / 1000)
+                 + _dt.timedelta(hours=8))
+            have_sum.add(d.strftime("%Y-%m-%d"))
+        # 缺叙事的天
+        missing = set()
+        for r in con.execute("SELECT date_key, structured_json FROM daily_summary"):
+            try:
+                d = _json.loads(r["structured_json"]) if r["structured_json"] else {}
+            except Exception:  # noqa: BLE001
+                d = {}
+            if not (d.get("narrative") or "").strip():
+                missing.add(str(r["date_key"]))
+    finally:
+        con.close()
+
+    keep = [d for d in days if d in have_sum and d in missing]
+    print("  过滤: %d 天 -> %d 天（有片总结 %d / 缺叙事 %d / 交集 %d）"
+          % (len(days), len(keep), len(have_sum), len(missing),
+             len(have_sum & missing)), flush=True)
+    return keep
 
 
 def main() -> int:
@@ -58,7 +126,19 @@ def main() -> int:
     ap.add_argument("--limit", type=int, default=0)
     ap.add_argument("--workers", type=int, default=1,
                     help="并发进程数；1 = 串行。实测 4 进程约 2 倍")
+    ap.add_argument("--llm", action="store_true",
+                    help="调模型生成叙事（需 DL_LLM_BASE_URL / DL_LLM_API_KEY / "
+                         "DL_LLM_MODEL 三个环境变量）。不加则只跑模板路径，narrative 保持为空。")
+    ap.add_argument("--only-missing", action="store_true",
+                    help="只跑「有片总结但缺叙事」的天。省掉没有原料的天（喂空给模型没意义）。")
     args = ap.parse_args()
+
+    if args.llm:
+        _cli = _make_client()
+        if _cli is None:
+            print("错误: --llm 需要 DL_LLM_BASE_URL / DL_LLM_API_KEY / DL_LLM_MODEL "
+                  "三个环境变量，当前不完整。", flush=True)
+            return 2
 
     con = sqlite3.connect(paths.db_path())
     con.row_factory = sqlite3.Row
@@ -69,15 +149,18 @@ def main() -> int:
         days = [r["date_key"] for r in con.execute(
             "SELECT date_key FROM daily_summary ORDER BY date_key")]
     con.close()
+    if args.only_missing:
+        days = _filter_missing_narrative(days)
     if args.limit:
         days = days[: args.limit]
-    print("待重生成: %d 天（并发 %d）" % (len(days), args.workers), flush=True)
+    print("待重生成: %d 天（并发 %d，模型 %s）"
+          % (len(days), args.workers, "ON" if args.llm else "OFF"), flush=True)
 
     ok = fail = 0
     t0 = time.time()
     if args.workers <= 1:
         for i, d in enumerate(days, 1):
-            _d, good, err = _one(d)
+            _d, good, err = _one(d, persist=True)
             if good:
                 ok += 1
             else:
@@ -88,7 +171,8 @@ def main() -> int:
     else:
         from concurrent.futures import ProcessPoolExecutor
         with ProcessPoolExecutor(max_workers=args.workers) as ex:
-            for i, (d, good, err) in enumerate(ex.map(_one, days), 1):
+            for i, (d, good, err) in enumerate(
+                    ex.map(_one, days, [True] * len(days)), 1):
                 if good:
                     ok += 1
                 else:

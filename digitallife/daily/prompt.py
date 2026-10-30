@@ -5,6 +5,8 @@
 from __future__ import annotations
 
 import json
+import os
+
 from .render import _strip_md_heads
 from .render_body import _device_label
 
@@ -91,8 +93,14 @@ def _llm_narrative(client, date_key: str, breakdown: dict,
                   "不要编造、不要写任何以 # 开头的行）：\n"
                   + json.dumps(facts, ensure_ascii=False))
 
+    # 预算不是安全带，是步长（DL-12）。2026-10-30 实测同一段 3,140 token 原料：
+    #   max_tokens=8192 -> 58.1s，推理 1,790 token，输出 1,110 字
+    #   max_tokens=2048 -> 32.1s，推理   383 token，输出 1,159 字
+    # 降预算后**更快且输出更多**——推理 token 吃掉的时间不会变成正文。
+    # 故默认 2048；DL_LLM_DAILY_MAX_TOKENS 可覆盖（截断时调大）。
+    _budget = int(os.environ.get("DL_LLM_DAILY_MAX_TOKENS") or 2048)
     try:
-        resp = client.chat([{"role": "user", "content": prompt}], max_tokens=8192)
+        resp = client.chat([{"role": "user", "content": prompt}], max_tokens=_budget)
     except Exception:  # noqa: BLE001 —— 模型故障不阻塞日报
         return None, None
     if not isinstance(resp, dict):
