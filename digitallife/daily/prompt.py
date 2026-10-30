@@ -100,11 +100,26 @@ def _llm_narrative(client, date_key: str, breakdown: dict,
     # 故默认回到 8192（原值），仅保留环境变量覆盖能力。
     # 想省钱时按日调小，但**必须先抽查输出字数**，别拿空叙事换速度。
     _budget = int(os.environ.get("DL_LLM_DAILY_MAX_TOKENS") or 8192)
-    try:
-        resp = client.chat([{"role": "user", "content": prompt}], max_tokens=_budget)
-    except Exception:  # noqa: BLE001 —— 模型故障不阻塞日报
-        return None, None
-    if not isinstance(resp, dict):
+
+    # **空返回必须重试**（2026-10-31 实测，这不是可选项）：
+    #   同一批 110 天里 30 天返回空或极短，其中 3 天原样重跑**全部救回**
+    #   （2,281 / 7,809 / 6,867 字）。原料字数与成败无明显相关
+    #   （成功案例最长 124,758 字，失败最短仅 6,360 字，重叠严重）——
+    #   这是模型侧随机空返回（与 DL-12 记录的同一现象），不是我们的 prompt 有问题。
+    # 不重试的后果：30/110 = 27% 的天白跑，等于 110 次调用里有 30 次纯浪费。
+    _tries = max(1, int(os.environ.get("DL_LLM_DAILY_RETRIES") or 3))
+    resp = None
+    for _i in range(_tries):
+        try:
+            _r = client.chat([{"role": "user", "content": prompt}], max_tokens=_budget)
+        except Exception:  # noqa: BLE001 —— 模型故障不阻塞日报，但继续试
+            _r = None
+        if isinstance(_r, dict) and (_r.get("content") or "").strip():
+            resp = _r
+            break
+        # 空返回：下一轮把预算放大（DL-12 的同一手法：预算太小会让内容被思考吃光）
+        _budget = min(_budget * 2, 65536)
+    if resp is None:
         return None, None
     text = (resp.get("content") or "").strip()
     # 双保险：提示词已明令禁止，但实测旧版仍会写 `## 凌晨启动：…`。
