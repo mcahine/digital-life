@@ -90,11 +90,12 @@ def collect(con: sqlite3.Connection, retry_failed: bool = False) -> list[tuple]:
         "WHERE kind='web' AND url IS NOT NULL AND url != '' "
         "GROUP BY url, title ORDER BY COUNT(*) DESC").fetchall()
 
+    # 2026-11-02：不依赖调用方设过 row_factory —— collect() 曾被外部脚本以裸连接
+    # 调用而抛 TypeError(tuple indices must be integers)。索引取值最稳。
     existing = {}
     for r in con.execute(
             "SELECT url, title, status, failure_kind FROM link_title"):
-        existing[str(r["url"])] = (str(r["title"] or ""), str(r["status"] or ""),
-                                   str(r["failure_kind"] or ""))
+        existing[str(r[0])] = (str(r[1] or ""), str(r[2] or ""), str(r[3] or ""))
 
     by_url: dict[str, list[str]] = {}
     for r in rows:
@@ -113,8 +114,15 @@ def collect(con: sqlite3.Connection, retry_failed: bool = False) -> list[tuple]:
         prev = existing.get(u)
         if prev:
             pt, st, fk = prev
-            if st == "ok" and pt and not needs_title(pt, u):
-                continue                      # 库里已有可用标题
+            # 2026-11-02 修（验证器发现）：status=ok 一律跳过，不看 title 是否可用。
+            # 旧写法 st=="ok" and pt and not needs_title(...) 有漏洞：
+            # 若某行 ok 但 title 恰好被判 needs_title（例如标题就等于域名），
+            # 它就会掉进待抓队列，于是每轮都被重抓。实测第 1 轮成功的 7 条
+            # 在第 2 轮又被打了一遍 —— 这正是「断点续跑失效」的实质。
+            # 口径：抓过且成功过就不再抓；标题不够好是渲染侧的降级问题，
+            # 不是「该重抓」的理由。
+            if st == "ok":
+                continue
             if fk in (linktitle.KIND_DEAD, linktitle.KIND_NO_TITLE):
                 dead += 1
                 continue                      # 页面已死 / 本无标题，永不再碰

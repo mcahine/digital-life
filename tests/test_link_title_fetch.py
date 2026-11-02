@@ -185,3 +185,114 @@ def test_canon_url_keeps_meaningful_params():
     got = linktitle.canon_url("https://x.com/search?q=hello&page=2")
     assert "q=hello" in got
     assert "page=2" in got
+
+# ---------------------------------------------------------------- 4. 断点续跑（验收项 6）
+
+def test_collect_skips_ok_urls():
+    """已 status='ok' 的 URL 绝不重回待抓队列。
+
+    2026-11-02 验证器发现的真实缺陷：旧写法
+        if st == "ok" and pt and not needs_title(pt, u): continue
+    有个漏洞 —— 若某行 ok 但 title 恰好被判 needs_title（如标题就等于域名），
+    它就会掉进待抓队列，于是**每轮都被重抓**。这正是「断点续跑失效」的实质。
+    修法：status='ok' 一律跳过，不看 title 是否可用。
+    """
+    import sqlite3
+
+    from digitallife import paths
+    from scripts import fetch_titles as FT
+
+    con = sqlite3.connect(str(paths.db_path()))
+    con.row_factory = sqlite3.Row
+    try:
+        ok_urls = {r[0] for r in con.execute(
+            "SELECT url FROM link_title WHERE status='ok' LIMIT 300")}
+        if not ok_urls:
+            pytest.skip("库里没有 ok 记录")
+        todo = FT.collect(con, retry_failed=True)   # 最激进模式
+        in_todo = set()
+        for _h, _o, members in todo:
+            in_todo.update(members)
+        relapse = ok_urls & in_todo
+        assert not relapse, "已成功的 URL 又进了待抓队列: %d 个" % len(relapse)
+    finally:
+        con.close()
+
+
+# ---------------------------------------------------------------- 5. 缓存零写入（验收项 7）
+
+def test_fetch_does_not_write_disk_cache():
+    """抓取链路只写 sqlite，不得碰 tmp/.datacache 与 tmp/.pagecache。
+
+    这是用户明确要求（「别给我本地留一大堆缓存垃圾」），且历史上
+    tmp/.titlecache.json 已被废弃（每次建页重抓、跨进程不一致）。
+    断言方式：抓一条后两目录的文件数/字节数不变。
+    """
+    from pathlib import Path
+
+    tmp = Path(__file__).resolve().parents[1] / "tmp"
+
+    def snap():
+        out = {}
+        for d in (".datacache", ".pagecache"):
+            p = tmp / d
+            fs = [x for x in p.rglob("*") if x.is_file()] if p.exists() else []
+            out[d] = (len(fs), sum(x.stat().st_size for x in fs))
+        return out
+
+    before = snap()
+    linktitle.fetch_detail("http://127.0.0.1:1/never", timeout=1.0)
+    after = snap()
+    assert before == after, "抓取写入了磁盘缓存: %r -> %r" % (before, after)
+
+def test_collect_skips_ok_even_if_title_looks_like_domain():
+    """构造性回归（S20）：ok 但 title 恰好是域名形态的行，也不得重回待抓。
+
+    这是旧实现的真实缺陷：
+        if st == "ok" and pt and not needs_title(pt, u): continue
+    —— 若 title 被判 needs_title（如标题就等于主机名），该 ok 行每轮都被重抓。
+    实测（2026-11-02）：注入此类行后，旧实现的 collect() 会把它排进待抓（RELAPSE），
+    修复后 CLEAN。**触发条件必须真的构造出来**，否则断言恒绿（S58）。
+    """
+    import sqlite3
+    from digitallife import paths
+    from scripts import fetch_titles as FT
+
+    probe = "http://hostlike-probe.example/page?utm_source=x"
+    con = sqlite3.connect(str(paths.db_path()))
+    con.row_factory = sqlite3.Row
+    try:
+        con.execute("DELETE FROM link_title WHERE url=?", (probe,))
+        con.execute("DELETE FROM event WHERE url=?", (probe,))
+        con.execute(
+            "INSERT INTO event(event_id, device, kind, source, start_utc_ms,"
+            " end_utc_ms, app, title, url, payload, ingest_run)"
+            " VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+            ("S20-%d" % abs(hash(probe)), "pc-main", "web", "shion", 1, 2,
+             "chrome", probe, probe, "{}", "s20"))
+        # 关键：status='ok' 但 title 恰好是主机名 -> needs_title 为 True
+        con.execute(
+            "INSERT INTO link_title(url, title, source, status, fetched_at)"
+            " VALUES(?,?,?,?,0) ON CONFLICT(url) DO UPDATE SET"
+            " title=excluded.title, status=excluded.status",
+            (probe, "hostlike-probe.example", "http", "ok"))
+        con.commit()
+
+        # 前置断言：触发条件成立（S58：先确认条件真被构造出来）
+        assert linktitle.needs_title("hostlike-probe.example", probe), \
+            "触发条件未成立，本测试无意义"
+
+        todo = FT.collect(con, retry_failed=True)
+        in_todo = set()
+        for _h, _o, members in todo:
+            in_todo.update(members)
+        assert probe not in in_todo, \
+            "ok 但标题像域名的行又进了待抓队列（断点续跑失效）"
+    finally:
+        con.execute("DELETE FROM link_title WHERE url=?", (probe,))
+        con.execute("DELETE FROM event WHERE url=?", (probe,))
+        con.commit()
+        left = con.execute(
+            "SELECT COUNT(*) FROM link_title WHERE url=?", (probe,)).fetchone()[0]
+        con.close()
+        assert left == 0, "测试残留未清理（S16）"
