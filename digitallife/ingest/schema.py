@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import sqlite3
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 DDL = """
 CREATE TABLE IF NOT EXISTS meta (
@@ -121,9 +121,24 @@ _LINK_TITLE_DDL = (
     "CREATE TABLE IF NOT EXISTS link_title ("
     "  url        TEXT PRIMARY KEY,"
     "  title      TEXT NOT NULL DEFAULT '',"
-    "  source     TEXT NOT NULL DEFAULT 'http',"   # http | window | raw | manual
+    "  source     TEXT NOT NULL DEFAULT 'http',"   # http | window | raw | manual | backfill
     "  status     TEXT NOT NULL DEFAULT 'ok',"     # ok | failed
-    "  fetched_at INTEGER NOT NULL DEFAULT 0)"
+    "  fetched_at INTEGER NOT NULL DEFAULT 0,"
+    # v3（2026-11-02）：失败分类 + 重试计数。
+    # 为什么必需：早期所有失败都记 status='failed'，**412（被限流）与 404（页面已死）
+    # 混在一起**，重跑时把 412 的又打一遍 —— 这等于持续激怒对方。分类后才谈得上
+    # 「blocked 等冷却 / dead 永不重试 / timeout 限次」三种处置。
+    "  failure_kind TEXT NOT NULL DEFAULT '',"
+    "  attempts   INTEGER NOT NULL DEFAULT 0)"
+)
+
+# v3 新增列（旧库补列用，见 MIGRATIONS[3]）。
+# 注意：SQLite 的 ALTER TABLE ADD COLUMN **没有 IF NOT EXISTS**，
+# 重复执行会报 "duplicate column name"。_migrate 按 schema_version 断点跳过，
+# 且本函数在 _migrate 里对每一列都先查 PRAGMA 兜底（见 _add_column）。
+_LINK_TITLE_V3_COLS = (
+    ("failure_kind", "TEXT NOT NULL DEFAULT ''"),
+    ("attempts", "INTEGER NOT NULL DEFAULT 0"),
 )
 
 DDL = (
@@ -142,6 +157,14 @@ DDL = (
 # 顺序由 init_db 保证：先 _migrate（补表）→ 再 executescript(DDL)（建索引，S30）。
 MIGRATIONS: dict[int, list[str]] = {
     2: [_LINK_TITLE_DDL],
+    # v3（2026-11-02）：link_title 增加 failure_kind / attempts。
+    # 用 _add_column 而非裸 ALTER：SQLite 的 ADD COLUMN 无 IF NOT EXISTS，
+    # 而老库可能已被人手工加过列（或本函数在中途中断后重跑），裸语句会报
+    # "duplicate column name" 把整次 init_db 打断。
+    3: [
+        "ALTER TABLE link_title ADD COLUMN failure_kind TEXT NOT NULL DEFAULT ''",
+        "ALTER TABLE link_title ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0",
+    ],
 }
 
 
@@ -175,6 +198,17 @@ def _migrate(con: sqlite3.Connection) -> None:
         if target <= ver:
             continue
         for stmt in MIGRATIONS[target]:
+            # ALTER TABLE ... ADD COLUMN 重跑会报 duplicate column name。
+            # 先解析目标列名查 PRAGMA，已存在就跳过 —— 让迁移**可重放**。
+            low = stmt.strip().lower()
+            if low.startswith("alter table") and " add column " in low:
+                parts = stmt.split()
+                # ALTER TABLE <t> ADD COLUMN <col> <type...>
+                tbl = parts[2]
+                col = parts[5]
+                have = {r[1] for r in con.execute("PRAGMA table_info(%s)" % tbl)}
+                if col in have:
+                    continue
             con.execute(stmt)
 
 

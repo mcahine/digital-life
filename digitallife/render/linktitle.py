@@ -71,6 +71,42 @@ def is_url(s: str) -> bool:
     return str(s or "").strip().startswith(("http://", "https://"))
 
 
+# 纯追踪参数：去掉后仍指向同一页面，不影响落地内容。
+# 2026-10-30 实测：49,580 个待抓 URL 里，仅靠规范化就能合并掉 8,600 个（17.3%）。
+# 2026-11-02：从 scripts/fetch_titles.py **移入本模块**（DL-23 单一出处）——
+#   抓取侧去重与回填侧分组必须用同一个规范化实现，否则两边分组不同、
+#   回填会把标题写错组。fetch_titles 保留同名别名（指向同一对象，不是副本）。
+TRACK_PARAMS = frozenset({
+    "spm_id_from", "vd_source", "from_source", "share_source", "share_medium",
+    "bbid", "seid", "spm", "tab", "ts",
+    "utm_source", "utm_medium", "utm_campaign", "utm_term", "utm_content", "utm_id",
+    "sca_esv", "sxsrf", "ved", "ei", "uact", "oq", "gs_lp", "sclient", "biw", "bih",
+})
+
+
+def canon_url(u: str) -> str:
+    """URL 规范化：去追踪参数、去尾斜杠、去 fragment。失败返回原串。
+
+    **不能把规范化后的 URL 当落库键**：页面链接用的是原始 URL，
+    改了键渲染时就匹配不上。用途只有两个：
+      1. 抓取队列里「同一页面的不同追踪变体」只出现一次；
+      2. 回填时把同一组变体认出来，让一条成功标题覆盖全组。
+    """
+    raw = str(u or "").strip()
+    try:
+        from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+
+        p = urlsplit(raw)
+        if not p.netloc:
+            return raw
+        q = [(k, v) for k, v in parse_qsl(p.query, keep_blank_values=True)
+             if k.lower() not in TRACK_PARAMS]
+        return urlunsplit((p.scheme, p.netloc, (p.path or "").rstrip("/"),
+                           urlencode(q), ""))
+    except Exception:  # noqa: BLE001 —— 畸形 URL 原样返回，由 fetch 去拒
+        return raw
+
+
 def needs_title(title: str, url: str) -> bool:
     """这个 URL 是否**真的**缺一个可读标题（要不要去抓）。
 
@@ -179,21 +215,34 @@ def db_title(url: str) -> str:
 
 
 def save(con: sqlite3.Connection, url: str, title: str, *, source: str = "http",
-         status: str = "ok") -> None:
-    """写一行并同步内存（建页读的是内存）。**不去重冲突**：后写覆盖前写。"""
+         status: str = "ok", failure_kind: str = "") -> None:
+    """写一行并同步内存（建页读的是内存）。**不去重冲突**：后写覆盖前写。
+
+    failure_kind（2026-11-02）：失败原因分类，见上方 KIND_* 常量。
+    成功时传空串。它决定**下次还抓不抓**：
+      dead / no_title -> collect() 永不再试
+      blocked         -> 等熔断冷却后再试
+      timeout         -> 限次重试
+    attempts 每次落库自增（成功也算一次），供「超次数就放弃」使用。
+    """
     u = str(url or "").strip()
     if not u:
         return
     import time
     con.execute(
-        "INSERT INTO link_title(url, title, source, status, fetched_at) "
-        "VALUES(?,?,?,?,?) ON CONFLICT(url) DO UPDATE SET "
+        "INSERT INTO link_title(url, title, source, status, fetched_at, "
+        "                      failure_kind, attempts) "
+        "VALUES(?,?,?,?,?,?,1) ON CONFLICT(url) DO UPDATE SET "
         "title=excluded.title, source=excluded.source, "
-        "status=excluded.status, fetched_at=excluded.fetched_at",
-        (u, str(title or "")[:300], source, status, int(time.time())))
+        "status=excluded.status, fetched_at=excluded.fetched_at, "
+        "failure_kind=excluded.failure_kind, "
+        "attempts=link_title.attempts+1",
+        (u, str(title or "")[:300], source, status, int(time.time()),
+         str(failure_kind or "")))
     d = _db()
     with _lock:
-        d[u] = {"title": str(title or "")[:300], "source": source, "status": status}
+        d[u] = {"title": str(title or "")[:300], "source": source,
+                "status": status, "failure_kind": str(failure_kind or "")}
 
 
 # ---------------------------------------------------------------- 抓取（仅 fetch_titles.py 调）
@@ -202,35 +251,117 @@ def save(con: sqlite3.Connection, url: str, title: str, *, source: str = "http",
 _UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
        "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
 
+# ---------------------------------------------------------------- 失败分类
+# 2026-11-02：早期把一切失败都塞进 status='failed'，导致
+#   412（被限流）与 404（页面已死）混在一起，重跑时把 412 的又打一遍，
+#   等于持续激怒对方。分四类，各有处置：
+#     blocked  412/429/403 —— 不是「这条 URL 的失败」，是该站正在拒绝我们。
+#                            应熔断该域名、冷却后重试，不计入永久失败。
+#     dead     404/410     —— 页面确实不存在，永不再抓。
+#     timeout  超时/连接错 —— 可重试，但有次数上限。
+#     no_title 200 但无标题 —— 页面本来就没 title，永不再抓。
+KIND_OK = "ok"
+KIND_BLOCKED = "blocked"
+KIND_DEAD = "dead"
+KIND_TIMEOUT = "timeout"
+KIND_NO_TITLE = "no_title"
+
+# blocked 的 HTTP 状态码：412 是 bilibili 风控的固定回应（实测），429 是通用限流。
+_BLOCKED_CODES = frozenset({403, 412, 418, 429})
+_DEAD_CODES = frozenset({404, 410, 451})
+
+# 进程级共享 Client。
+# 2026-11-02 实测：每条 URL 新建 Client 时 4.05 s/条，复用后 0.86 s/条 = 4.71x。
+# 差别来自 TLS 握手与连接池重建，与 UA/压缩协商无关。
+# 线程安全：httpx.Client 自身线程安全，可被 ThreadPoolExecutor 共享。
+_client = None
+_client_lock = threading.Lock()
+
+
+def _get_client(timeout: float = 6.0):
+    """取（或建）进程级 httpx.Client。建不出来返回 None。"""
+    global _client
+    if _client is not None:
+        return _client
+    with _client_lock:
+        if _client is not None:
+            return _client
+        try:
+            import httpx
+
+            _client = httpx.Client(
+                headers={"User-Agent": _UA},
+                timeout=httpx.Timeout(timeout, connect=min(5.0, timeout)),
+                limits=httpx.Limits(max_connections=16,
+                                    max_keepalive_connections=16),
+                follow_redirects=True,
+            )
+            return _client
+        except Exception:  # noqa: BLE001
+            return None
+
+
+def close_client() -> None:
+    """关掉共享 Client（脚本收尾用；进程退出时自动回收）。"""
+    global _client
+    with _client_lock:
+        if _client is not None:
+            try:
+                _client.close()
+            except Exception:  # noqa: BLE001
+                pass
+            _client = None
+
+
+def fetch_detail(url: str, timeout: float = 6.0) -> tuple:
+    """抓标题并返回失败分类：(title, kind)。
+
+    kind 取值见上方常量。成功时 title 非空且 kind == KIND_OK。
+    这是抓取侧真正该用的函数；fetch() 仅为兼容旧调用保留。
+    """
+    u = str(url or "").strip()
+    if not u.startswith(("http://", "https://")):
+        return "", KIND_DEAD          # 畸形/非 http，永不再试
+    cli = _get_client(timeout)
+    if cli is None:
+        return "", KIND_TIMEOUT
+    try:
+        r = cli.get(u)
+    except Exception:  # noqa: BLE001
+        # 超时与连接类错误都算可重试；其余也按可重试处理（不判死）
+        return "", KIND_TIMEOUT
+    if r.status_code in _BLOCKED_CODES:
+        return "", KIND_BLOCKED
+    if r.status_code in _DEAD_CODES:
+        return "", KIND_DEAD
+    if r.status_code >= 400:
+        return "", KIND_DEAD
+    try:
+        html = r.text
+    except Exception:  # noqa: BLE001
+        return "", KIND_TIMEOUT
+    m = re.search(r"<title[^>]*>(.*?)</title>", html, re.S | re.I)
+    if not m:
+        return "", KIND_NO_TITLE
+    t = re.sub(r"\s+", " ", m.group(1)).strip()[:300]
+    # 抓到「出错啦」「403 Forbidden」这类风控页标题也算没抓到
+    if not t or is_hostlike(t, u):
+        return "", KIND_NO_TITLE
+    return t, KIND_OK
+
 
 def fetch(url: str, timeout: float = 6.0) -> str:
     """联网抓 <title>。失败返回空串，绝不抛异常（建页/批处理不能因网络失败）。
 
     **为什么用 httpx 而不是 urllib**（2026-10-30 实测，同 UA 同 URL）：
-        urllib  -> 352,359 B，返回简化页，**取不到 <title>**
+        urllib  -> 352,359 B，返回简化页，取不到 <title>
         httpx   -> 2,353,573 B，title 正常
     差别在 HTTP 实现自身（连接/头/压缩协商），不是 UA。
-    实测 bilibili 占待抓缺口的 52%（25,932 个），用 urllib 时 100% 失败，
-    换 httpx 后能抓回来 —— 这比「跳过 bilibili」多保住 2.6 万个标题。
-    httpx 本就是项目依赖（pyproject.toml: httpx>=0.27），无新增成本。
-    """
-    u = str(url or "").strip()
-    if not u.startswith(("http://", "https://")):
-        return ""
-    try:
-        import httpx
 
-        r = httpx.get(u, headers={"User-Agent": _UA},
-                      timeout=timeout, follow_redirects=True)
-        if r.status_code >= 400:
-            return ""
-        html = r.text
-        m = re.search(r"<title[^>]*>(.*?)</title>", html, re.S | re.I)
-        if not m:
-            return ""
-        return re.sub(r"\s+", " ", m.group(1)).strip()[:300]
-    except Exception:  # noqa: BLE001 —— 网络失败不阻塞调用方
-        return ""
+    2026-11-02：改用进程级共享 Client（实测 4.05 s -> 0.86 s/条）。
+    签名与「失败返回空串」契约不变；需要失败原因时用 fetch_detail()。
+    """
+    return fetch_detail(url, timeout)[0]
 
 
 # ---------------------------------------------------------------- 单一真相

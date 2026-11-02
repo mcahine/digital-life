@@ -1,46 +1,72 @@
 #!/usr/bin/env python
-"""批量抓取网页标题 → 写进 **link_title 表**（不是磁盘缓存）。
+"""批量抓取网页标题 -> 写进 link_title 表（不是磁盘缓存）。
 
 用户第 3 条诉求（2026-10-25 原话）：
   「对于那些没有标题的链接，可以爬取链接获得标题，不是放到硬盘缓存，可以存入
    数据库当中。当然，没有爬取到域名，就原来的模样就好。」
 
-改前：缓存落 tmp/.titlecache.json。tmp 被 .gitignore 排除、不进备份、
-清一次就全丢；而建页读的正是那份文件，丢了就"标题又变回域名了"。
-
-为什么仍然分成两步（抓取 vs 渲染）：
-  建页要快且确定。联网会把 753 页从 6 分钟变成不可预估，还可能因为某个站反爬
+为什么仍然分两步（抓取 vs 渲染）：
+  建页要快且确定。联网会让 753 页从 6 分钟变成不可预估，还可能因为某个站反爬
   卡住整批。所以：
-    1. 本脚本联网抓标题写库（可以慢慢跑、可以中断、可重跑）
-    2. build_slice_html.py 只**读库**（纯本地，快且稳定，渲染期绝不联网）
+    1. 本脚本联网抓标题写库（可慢慢跑、可中断、可重跑）
+    2. build_slice_html.py 只读库（纯本地，渲染期绝不联网）
+
+=== 2026-11-02 重写：治「被封」，不是治症状 ===
+
+上一轮实跑（37,070 条 / 9.1 小时 / 成功率 41.1%）暴露的不是代码 bug，是策略缺陷。
+时序证据（决定性）：
+
+    11-02 10 时  ->  77.4%
+    11-02 11 时  ->  31.9%
+    11-02 12 时  ->   0.3%     <- 几乎全灭
+    11-02 13 时  ->  12.3%
+    11-02 14 时  ->  57.7%     <- 冷却后恢复
+
+bilibili 视频页返回 HTTP 412 + captcha（实测）。旧实现把 412 当成「这条 URL 的失败」
+继续以同样速度打 —— 等于持续激怒对方。四处改动：
+
+  1) 连接复用：4.05 s/条 -> 0.86 s/条（实测 4.7-12.5x）。
+     旧实现每条 URL 新建 httpx.Client，TLS 握手全白付。
+  2) 失败分类：412/429 -> blocked（熔断+冷却），404 -> dead（永不重试），
+     超时 -> timeout（限次）。旧实现全塞 status='failed'，重跑时把 412 的又打一遍。
+  3) 域名熔断：某域连续失败就只降这个域，不拖累其他域
+     （实测失败 Top5 域名占 72.2%）。
+  4) 落库修正：规范化组内**所有**变体一起落库。旧实现只写 members[0]，
+     实测白抓了 7,452 个变体 —— 抓到标题了但没写进去，页面仍显示「域名·BV号」。
 
 抓不到也落行（status='failed'）：否则每次建页都会重抓同一个抓不到的地址，
-而"抓不到"本身是稳定结论（域名已死 / 需要登录 / 反爬）。
+而「抓不到」本身是稳定结论（域名已死 / 需要登录 / 反爬）。failure_kind 记下理由。
 
 用法::
 
-    python scripts/fetch_titles.py --stat         # 只统计规模，不联网
-    python scripts/fetch_titles.py --limit 200    # 先试 200 条
-    python scripts/fetch_titles.py --workers 8    # 全量，8 并发
-    python scripts/fetch_titles.py --retry-failed # 连之前失败的也重抓
-
-只抓「标题只是域名」的那些 URL —— 已经有真实标题的行不需要联网。
+    python scripts/fetch_titles.py --stat          # 只统计规模，不联网
+    python scripts/fetch_titles.py --limit 200     # 先试 200 条
+    python scripts/fetch_titles.py --workers 8     # 全量（硬上限 12）
+    python scripts/fetch_titles.py --retry-failed  # 连之前失败的也重抓
 """
 from __future__ import annotations
 
 import argparse
 import sqlite3
 import sys
+import threading
 import time
+from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
-# T1 (2026-10-25): sys.path.insert removed -- package is installable via pip install -e .
-# T1 (2026-10-25): sys.path.insert removed -- package is installable via pip install -e .
+from digitallife import paths
+from digitallife.ingest.schema import init_db
+from digitallife.render import linktitle
+from digitallife.render.linktitle import canon_url, needs_title
 
-from digitallife import paths  # noqa: E402
-from digitallife.ingest.schema import init_db  # noqa: E402
-from digitallife.render import linktitle  # noqa: E402
+# 2026-11-02：canon_url 与 TRACK_PARAMS 已移入 linktitle（DL-23 单一出处）。
+# 抓取侧去重与回填侧分组必须共用一个规范化实现，否则回填会把标题写到错组。
+_TRACK_PARAMS = linktitle.TRACK_PARAMS
+
+# 并发硬上限：实测上一轮 6 并发跑 9 小时就被 bilibili 全面封禁。
+# 12 是「在没被封的前提下尽量快」的上界，再高就是自己找封。
+MAX_WORKERS = 12
 
 
 def open_db() -> sqlite3.Connection:
@@ -53,58 +79,23 @@ def open_db() -> sqlite3.Connection:
     return con
 
 
-# 纯追踪参数：去掉后仍指向同一页面，不影响落地内容。
-# 2026-10-30 实测：49,580 个待抓 URL 里，仅靠规范化就能合并掉 8,600 个（17.3%）。
-_TRACK_PARAMS = frozenset({
-    "spm_id_from", "vd_source", "from_source", "share_source", "share_medium",
-    "bbid", "seid", "spm", "tab", "ts",
-    "utm_source", "utm_medium", "utm_campaign", "utm_term", "utm_content", "utm_id",
-    "sca_esv", "sxsrf", "ved", "ei", "uact", "oq", "gs_lp", "sclient", "biw", "bih",
-})
+def collect(con: sqlite3.Connection, retry_failed: bool = False) -> list[tuple]:
+    """返回 [(head_url, 原title, [组内全部url])]，只含缺可用标题的。
 
-
-def canon_url(u: str) -> str:
-    """URL 规范化：去掉追踪参数、去尾斜杠、去 fragment。失败返回原串。
-
-    **不能把规范化后的 URL 当落库键**：页面链接用的是原始 URL，
-    改了键渲染时就匹配不上。这里的用途只有一个 —— 让「同一页面的不同追踪变体」
-    在抓取队列里只出现一次，抓回来的标题按原始 URL 逐个落库。
-    """
-    raw = str(u or "").strip()
-    try:
-        from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
-
-        p = urlsplit(raw)
-        if not p.netloc:
-            return raw
-        q = [(k, v) for k, v in parse_qsl(p.query, keep_blank_values=True)
-             if k.lower() not in _TRACK_PARAMS]
-        return urlunsplit((p.scheme, p.netloc, (p.path or "").rstrip("/"),
-                           urlencode(q), ""))
-    except Exception:  # noqa: BLE001 —— 畸形 URL 原样返回，由 fetch 去拒
-        return raw
-
-
-def collect(con: sqlite3.Connection, retry_failed: bool = False) -> list[tuple[str, str]]:
-    """返回 [(url, 原 title)]，只含「title 是域名形态且库里没有可用标题」的。
-
-    判断走 linktitle 的同一套函数 —— 抓取侧与渲染侧的"缺不缺标题"口径必须一致，
+    判断走 linktitle 同一套函数 —— 抓取侧与渲染侧的「缺不缺标题」口径必须一致，
     否则会出现「脚本认为不缺、页面显示还是域名」这种自说自话。
     """
     rows = con.execute(
-        "SELECT url, title, COUNT(*) n FROM event "
+        "SELECT url, title FROM event "
         "WHERE kind='web' AND url IS NOT NULL AND url != '' "
-        "GROUP BY url, title ORDER BY n DESC"
-    ).fetchall()
+        "GROUP BY url, title ORDER BY COUNT(*) DESC").fetchall()
 
     existing = {}
-    for r in con.execute("SELECT url, title, status FROM link_title"):
-        existing[str(r["url"])] = (str(r["title"] or ""), str(r["status"] or ""))
+    for r in con.execute(
+            "SELECT url, title, status, failure_kind FROM link_title"):
+        existing[str(r["url"])] = (str(r["title"] or ""), str(r["status"] or ""),
+                                   str(r["failure_kind"] or ""))
 
-    # **先按 URL 聚合全部 title 再判断**：同一个 URL 在 event 表里可能有多条记录，
-    # 标题有的好有的只有域名。若逐行判断后直接 continue，一个"第一行是真标题、
-    # 第二行是域名"的 URL 会被误判成待抓（实测 todo 122 vs 真实缺口 100，多出的 22 条
-    # 全属这一类）。口径：**只要该 URL 有一条像样的标题，就不需要联网**。
     by_url: dict[str, list[str]] = {}
     for r in rows:
         u = str(r["url"] or "").strip()
@@ -113,36 +104,40 @@ def collect(con: sqlite3.Connection, retry_failed: bool = False) -> list[tuple[s
         by_url.setdefault(u, []).append(str(r["title"] or "").strip())
 
     seen: dict[str, str] = {}
+    dead = 0
     for u, titles in by_url.items():
-        # 判据用 needs_title（含「title 就是 URL 本身」这一大类）。
-        # 只用 is_hostlike 会漏掉 47,586 个 URL —— 实测全库无可读标题的是
-        # 47,657 个，而纯域名口径只有 71 个（2026-10-25）。
-        # 口径：**只要该 URL 有一条记录带可读标题，就不必联网**。
-        if any(t and not linktitle.needs_title(t, u) for t in titles):
+        # 口径：只要该 URL 有一条记录带可读标题，就不必联网。
+        if any(t and not needs_title(t, u) for t in titles):
             continue
         t = next((x for x in titles if x), "")
         prev = existing.get(u)
         if prev:
-            pt, st = prev
-            if st == "ok" and pt and not linktitle.needs_title(pt, u):
-                continue      # 库里已有可用标题
-            if st == "failed" and not retry_failed:
-                continue      # 上次已判定抓不到，不重复打扰
+            pt, st, fk = prev
+            if st == "ok" and pt and not needs_title(pt, u):
+                continue                      # 库里已有可用标题
+            if fk in (linktitle.KIND_DEAD, linktitle.KIND_NO_TITLE):
+                dead += 1
+                continue                      # 页面已死 / 本无标题，永不再碰
+            if st == "failed" and not retry_failed and fk in ("", linktitle.KIND_TIMEOUT):
+                continue                      # 旧失败记录，默认不重试
         seen[u] = t
 
-    # 规范化去重（2026-10-30）：同一页面的不同追踪变体只抓一次。
-    # 实测 bilibili 占缺口 52%，其 URL 大量带 spm_id_from / vd_source 等参数，
-    # 同一个视频会以 3-5 个变体各抓一遍 —— 规范化后只抓一次。
-    # 落库仍按原始 URL 逐个写（见 one()），保证渲染侧能按页面链接匹配。
+    if dead:
+        print("  跳过已判死/无标题：%d 条" % dead, flush=True)
+
+    # 规范化去重：同一页面的不同追踪变体只抓一次，
+    # 但**组内所有变体一起返回**（2026-11-02 修）。
+    # 旧实现 out.append((members[0], ...)) 只返回第一条，抓到后也只落那一条，
+    # 导致同组其他变体仍显示「域名·BV号」—— 实测白抓 7,452 个变体。
     groups: dict[str, list[str]] = {}
     for u in seen:
         groups.setdefault(canon_url(u), []).append(u)
 
-    out: list[tuple[str, str]] = []
+    out: list[tuple] = []
     merged = 0
     for _c, members in groups.items():
         members.sort()
-        out.append((members[0], seen[members[0]]))
+        out.append((members[0], seen[members[0]], list(members)))
         merged += len(members) - 1
     if merged:
         print("  规范化去重：%d 个 URL 合并为 %d 次抓取（省 %d 次）"
@@ -155,7 +150,7 @@ def stat(con: sqlite3.Connection) -> dict:
     rows = con.execute(
         "SELECT url, title FROM event WHERE kind='web' AND url IS NOT NULL AND url != '' "
         "GROUP BY url, title").fetchall()
-    # 口径必须与 collect() 完全一致：**按 URL 聚合全部 title**，
+    # 口径必须与 collect() 完全一致：按 URL 聚合全部 title，
     # 只要有一条不像域名就归为「有标题」。写两套口径会让 --stat 报的规模
     # 与实际要抓的条数对不上（实测曾报 100 vs 实抓 71）。
     urls: dict[str, list[str]] = {}
@@ -165,96 +160,287 @@ def stat(con: sqlite3.Connection) -> dict:
             continue
         urls.setdefault(u, []).append(str(r["title"] or "").strip())
     hostlike = [u for u, ts in urls.items()
-                if not any(t and not linktitle.needs_title(t, u) for t in ts)]
-    recs = con.execute("SELECT status, COUNT(*) c FROM link_title GROUP BY status").fetchall()
+                if not any(t and not needs_title(t, u) for t in ts)]
+    recs = con.execute(
+        "SELECT status, failure_kind, COUNT(*) c FROM link_title "
+        "GROUP BY status, failure_kind").fetchall()
+    by_kind: dict[str, int] = {}
+    for r in recs:
+        k = str(r["failure_kind"] or "") or str(r["status"] or "")
+        by_kind[k] = by_kind.get(k, 0) + int(r["c"])
     return {
         "distinct_url": len(urls),
         "has_title_url": len(urls) - len(hostlike),
         "hostlike_url": len(hostlike),
-        "db_ok": next((int(r["c"]) for r in recs if r["status"] == "ok"), 0),
-        "db_failed": next((int(r["c"]) for r in recs if r["status"] == "failed"), 0),
+        "by_kind": by_kind,
         "todo": len(collect(con)),
     }
 
 
-def one(factory, item: tuple[str, str], timeout: float) -> tuple[str, str, bool]:
-    """抓一条并落库。**失败也落 status='failed'**。"""
-    url, _old = item
-    t = linktitle.fetch(url, timeout=timeout)
-    con = factory()
-    try:
-        if t and not linktitle.needs_title(t, url):
-            linktitle.save(con, url, t, source="http", status="ok")
+# ---------------------------------------------------------------- 域名熔断
+
+class DomainGuard:
+    """按域名维护失败状态：只惩罚出问题的站，不拖累其他站。
+
+    2026-11-02 实测依据：失败 Top5 域名占全部失败 72.2%
+    （bilibili 12,709 / google 1,922 / space.bilibili 891 / csdn 737 / jiqizhixin 541）。
+    把这几家单独限速、其余照常跑 —— 旧实现一视同仁，被 bilibili 一家拖住全量。
+
+    规则：
+      连续失败 block_threshold 次 -> 该域熔断 cooldown 秒，期间跳过该域所有 URL
+      收到 blocked(412/429) -> **立刻**熔断该域，不等累积到阈值
+      dead/no_title 不计入 —— 那是页面级结论，不代表站点在拒绝我们
+    """
+
+    def __init__(self, block_threshold: int = 5, cooldown: float = 600.0):
+        self.block_threshold = block_threshold
+        self.cooldown = cooldown
+        self._lock = threading.Lock()
+        self._fail: dict[str, int] = defaultdict(int)
+        self._until: dict[str, float] = {}
+
+    def host(self, url: str) -> str:
+        return linktitle.host_of(url) or "(unknown)"
+
+    def is_open(self, url: str) -> bool:
+        """该域当前是否可放行（熔断期返回 False）。"""
+        h = self.host(url)
+        with self._lock:
+            until = self._until.get(h)
+            if until is None:
+                return True
+            if time.time() >= until:
+                self._until.pop(h, None)
+                self._fail[h] = 0
+                return True
+            return False
+
+    def record(self, url: str, kind: str) -> None:
+        h = self.host(url)
+        with self._lock:
+            if kind == linktitle.KIND_OK:
+                self._fail[h] = 0
+                return
+            if kind in (linktitle.KIND_DEAD, linktitle.KIND_NO_TITLE):
+                return                  # 页面级结论，不动站点状态
+            if kind == linktitle.KIND_BLOCKED:
+                self._until[h] = time.time() + self.cooldown
+                self._fail[h] = self.block_threshold
+                return
+            self._fail[h] += 1
+            if self._fail[h] >= self.block_threshold:
+                self._until[h] = time.time() + self.cooldown
+
+    def snapshot(self) -> dict:
+        with self._lock:
+            now = time.time()
+            return {"tripped": {h: int(u - now) for h, u in self._until.items() if u > now},
+                    "fails": {h: n for h, n in self._fail.items() if n}}
+
+
+class AdaptiveLimiter:
+    """自适应并发：连续成功提速，连续失败降速，收到 412/429 立刻降。
+
+    旧实现固定 --workers 6，对目标站是**恒定压力** —— 没有反馈回路，
+    所以只会一路撞到被全部封禁为止。
+    """
+
+    def __init__(self, start: int = 4, lo: int = 1, hi: int = 12,
+                 up_after: int = 20, down_after: int = 5):
+        self.cur = max(lo, min(hi, start))
+        self.lo, self.hi = lo, hi
+        self.up_after = up_after
+        self.down_after = down_after
+        self._lock = threading.Lock()
+        self._ok = 0
+        self._fail = 0
+        self.events: list[tuple] = []
+
+    def report(self, good: bool) -> None:
+        with self._lock:
+            if good:
+                self._ok += 1
+                self._fail = 0
+                if self._ok >= self.up_after and self.cur < self.hi:
+                    self.cur += 1
+                    self._ok = 0
+                    self.events.append((time.time(), self.cur, "up"))
+            else:
+                self._fail += 1
+                self._ok = 0
+                if self._fail >= self.down_after and self.cur > self.lo:
+                    self.cur = max(self.lo, self.cur - 2)
+                    self._fail = 0
+                    self.events.append((time.time(), self.cur, "down"))
+
+    def slow_down(self) -> None:
+        """收到 412/429 时立刻全局降速（不等连续失败累积）。"""
+        with self._lock:
+            if self.cur > self.lo:
+                self.cur = max(self.lo, self.cur // 2)
+                self.events.append((time.time(), self.cur, "blocked"))
+
+
+# ---------------------------------------------------------------- 抓取主体
+
+def _worker_factory():
+    c = sqlite3.connect(str(paths.db_path()), timeout=30)
+    c.row_factory = sqlite3.Row
+    c.execute("PRAGMA busy_timeout=30000")
+    return c
+
+
+def make_one(timeout: float, guard: DomainGuard):
+    """造一个「抓一条并落库」的函数（闭包持有 guard，便于单测注入）。"""
+
+    def one(item):
+        head, _old, members = item
+        if not guard.is_open(head):
+            # 熔断期：不抓，也不写库（留待冷却后重跑）
+            return head, "skip", 0.0
+        t0 = time.time()
+        title, kind = linktitle.fetch_detail(head, timeout=timeout)
+        dt = time.time() - t0
+        con = _worker_factory()
+        try:
+            if kind == linktitle.KIND_OK and title:
+                # 组内**所有**变体一起落库（2026-11-02 修，旧实现只写 members[0]）
+                for m in members:
+                    linktitle.save(con, m, title, source="http", status="ok")
+            else:
+                for m in members:
+                    linktitle.save(con, m, "", source="http", status="failed",
+                                   failure_kind=kind)
             con.commit()
-            return url, t, True
-        linktitle.save(con, url, "", source="http", status="failed")
-        con.commit()
-        return url, "", False
-    finally:
-        con.close()
+        finally:
+            con.close()
+        return head, kind, dt
+
+    return one
+
+
+def run_batch(todo, workers: int, timeout: float,
+              guard: DomainGuard | None = None,
+              limiter: AdaptiveLimiter | None = None) -> tuple:
+    """跑一批。返回 (ok, fail, skipped, kind_counts)。
+
+    动态提交：不是一次性把所有 future 塞进池子，而是按 limiter 当前并发决定
+    在飞数量 —— 否则「降并发」只是改了个变量，实际压力不变。
+    """
+    guard = guard or DomainGuard()
+    lim = limiter or AdaptiveLimiter(start=workers, hi=MAX_WORKERS)
+    kinds: dict[str, int] = defaultdict(int)
+    ok = fail = skipped = done = 0
+    lock = threading.Lock()
+    t0 = time.time()
+    total = len(todo)
+    one = make_one(timeout, guard)
+
+    in_flight = {}
+    idx = 0
+    with ThreadPoolExecutor(max_workers=max(1, MAX_WORKERS * 2)) as ex:
+        while idx < len(todo) or in_flight:
+            while idx < len(todo) and len(in_flight) < lim.cur:
+                in_flight[ex.submit(one, todo[idx])] = todo[idx]
+                idx += 1
+            if not in_flight:
+                break
+            f = next(as_completed(list(in_flight)))
+            in_flight.pop(f, None)
+            try:
+                _h, kind, _dt = f.result()
+            except Exception as exc:  # noqa: BLE001  单条异常不得整批崩
+                print("  [warn] %s" % str(exc)[:120], flush=True)
+                with lock:
+                    done += 1
+                    fail += 1
+                    kinds["error"] += 1
+                continue
+            with lock:
+                done += 1
+                kinds[kind] += 1
+                if kind == linktitle.KIND_OK:
+                    ok += 1
+                    guard.record(_h, kind)
+                    lim.report(True)
+                elif kind == "skip":
+                    skipped += 1
+                else:
+                    fail += 1
+                    guard.record(_h, kind)
+                    lim.report(False)
+                    if kind == linktitle.KIND_BLOCKED:
+                        lim.slow_down()
+                if done % 25 == 0 or done == total:
+                    print("  %d/%d ok=%d fail=%d skip=%d 并发=%d %.0fs"
+                          % (done, total, ok, fail, skipped, lim.cur,
+                             time.time() - t0), flush=True)
+    return ok, fail, skipped, dict(kinds), lim, guard
 
 
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--limit", type=int, default=0, help="只抓前 N 条（0 = 全部）")
-    ap.add_argument("--workers", type=int, default=6, help="并发数（默认 6，别开大）")
-    ap.add_argument("--timeout", type=float, default=6.0, help="单条超时秒")
+    ap.add_argument("--workers", type=int, default=6,
+                    help="起始并发（默认 6；硬上限 %d）" % MAX_WORKERS)
+    ap.add_argument("--timeout", type=float, default=10.0, help="单条超时秒")
     ap.add_argument("--stat", action="store_true", help="只统计规模，不联网")
     ap.add_argument("--retry-failed", action="store_true", help="连上次失败的也重抓")
+    ap.add_argument("--cooldown", type=float, default=600.0,
+                    help="域名熔断冷却秒数（默认 600）")
     args = ap.parse_args()
+
+    workers = max(1, min(MAX_WORKERS, args.workers))
+    if workers != args.workers:
+        print("  [note] --workers %d 超出上限，已钳到 %d" % (args.workers, workers),
+              flush=True)
 
     con = open_db()
     try:
         s = stat(con)
-        print("规模：distinct URL %d ｜ 无可用标题 %d ｜ 库内 ok %d / failed %d ｜ 待抓 %d"
-              % (s["distinct_url"], s["hostlike_url"], s["db_ok"], s["db_failed"], s["todo"]),
-              flush=True)
+        kinds = s["by_kind"]
+        print("规模：distinct URL %d ｜ 无可用标题 %d ｜ 待抓 %d"
+              % (s["distinct_url"], s["hostlike_url"], s["todo"]), flush=True)
+        print("  库内分类：ok %d ｜ blocked %d ｜ dead %d ｜ timeout %d ｜ no_title %d ｜ 空(old) %d"
+              % (kinds.get("ok", 0), kinds.get("blocked", 0), kinds.get("dead", 0),
+                 kinds.get("timeout", 0), kinds.get("no_title", 0),
+                 kinds.get("failed", 0)), flush=True)
         if args.stat:
             return 0
 
         todo = collect(con, retry_failed=args.retry_failed)
         if args.limit:
             todo = todo[: args.limit]
-        print("本次待抓 %d 条（并发 %d，单条超时 %.0fs）" % (len(todo), args.workers, args.timeout),
-              flush=True)
+        n_urls = sum(len(x[2]) for x in todo)
+        print("本次待抓 %d 组 / %d 个 URL（起始并发 %d，超时 %.0fs）"
+              % (len(todo), n_urls, workers, args.timeout), flush=True)
         if not todo:
             return 0
 
-        linktitle.load_from_db(con)      # 把已有标题装进内存，save() 会同步更新
-        ok = fail = 0
-        t0 = time.time()
+        linktitle.load_from_db(con)
+        ok, fail, skipped, kc, lim, guard = run_batch(
+            todo, workers, args.timeout,
+            guard=DomainGuard(cooldown=args.cooldown),
+            limiter=AdaptiveLimiter(start=workers, hi=MAX_WORKERS))
 
-        def factory():
-            c = sqlite3.connect(str(paths.db_path()), timeout=30)
-            c.row_factory = sqlite3.Row
-            c.execute("PRAGMA busy_timeout=30000")
-            return c
+        print()
+        print("完成：成功 %d / 失败 %d / 跳过(熔断) %d，成功率 %.1f%%"
+              % (ok, fail, skipped, ok * 100.0 / max(1, ok + fail)), flush=True)
+        print("  分类明细：%s" % kc, flush=True)
+        snap = guard.snapshot()
+        if snap["tripped"]:
+            print("  熔断中的域名：%s" % snap["tripped"], flush=True)
+        if lim.events:
+            print("  并发调整次数：%d（末值 %d）" % (len(lim.events), lim.cur), flush=True)
 
-        with ThreadPoolExecutor(max_workers=args.workers) as ex:
-            futs = [ex.submit(one, factory, it, args.timeout) for it in todo]
-            for i, f in enumerate(as_completed(futs), 1):
-                try:
-                    _url, _title, good = f.result()
-                except Exception as exc:  # noqa: BLE001  单条异常不得整批崩
-                    print("  [warn] %s" % str(exc)[:120], flush=True)
-                    fail += 1
-                    continue
-                if good:
-                    ok += 1
-                else:
-                    fail += 1
-                if i % 25 == 0:
-                    print("  %d/%d ok=%d fail=%d %.0fs" % (
-                        i, len(todo), ok, fail, time.time() - t0), flush=True)
-
-        print("完成：成功 %d / 失败 %d，耗时 %.1f 分钟；成功率 %.1f%%"
-              % (ok, fail, (time.time() - t0) / 60,
-                 (ok * 100.0 / max(1, ok + fail))), flush=True)
         s2 = stat(con)
-        print("库内现状：ok %d / failed %d / 仍待抓 %d"
-              % (s2["db_ok"], s2["db_failed"], s2["todo"]), flush=True)
+        k2 = s2["by_kind"]
+        print("库内现状：ok %d ｜ blocked %d ｜ dead %d ｜ timeout %d ｜ no_title %d ｜ 仍待抓 %d"
+              % (k2.get("ok", 0), k2.get("blocked", 0), k2.get("dead", 0),
+                 k2.get("timeout", 0), k2.get("no_title", 0), s2["todo"]), flush=True)
         return 0
     finally:
+        linktitle.close_client()
         con.close()
 
 
