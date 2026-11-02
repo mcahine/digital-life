@@ -296,3 +296,87 @@ def test_collect_skips_ok_even_if_title_looks_like_domain():
             "SELECT COUNT(*) FROM link_title WHERE url=?", (probe,)).fetchone()[0]
         con.close()
         assert left == 0, "测试残留未清理（S16）"
+
+# ---------------------------------------------------------------- 6. event 标题回填（验收项 1/2 核心）
+
+def test_backfill_event_titles_plan():
+    """event 表自带可读标题、link_title 无 ok 行的 URL，必须能被回填计划识别。
+
+    这修正了一个口径错误（2026-11-02 验证器第二轮）：
+      旧口径只认 link_title.status='ok' 才算「已有标题」，
+      但 bilibili 视频页的真标题常常就在 event.title 里（浏览器历史带下来的）：
+          url   = https://www.bilibili.com/video/BV18h4y1H7tq/?spm_id_from=...
+          title = '鸭 王 争 爸 3'
+      渲染 resolve() 第③级用它，页面看着正常 —— 但没落进 link_title。
+      任务书说的「同组其他变体没落库」正是这一类（32,024 个，含 bilibili 8,649）。
+    """
+    import sqlite3
+    from digitallife import paths
+    from scripts import backfill_event_titles as BET
+
+    probe = "http://event-title-probe.example/video/BVtest123"
+    con = sqlite3.connect(str(paths.db_path()))
+    con.row_factory = sqlite3.Row
+    try:
+        con.execute("DELETE FROM link_title WHERE url=?", (probe,))
+        con.execute("DELETE FROM event WHERE url=?", (probe,))
+        con.execute(
+            "INSERT INTO event(event_id, device, kind, source, start_utc_ms,"
+            " end_utc_ms, app, title, url, payload, ingest_run)"
+            " VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+            ("BET-%d" % abs(hash(probe)), "pc-main", "web", "shion", 1, 2,
+             "chrome", "真实的视频标题_哔哩哔哩_bilibili", probe, "{}", "bet"))
+        con.commit()
+
+        todo = BET.plan(con)
+        found = [u for u, _t in todo if u == probe]
+        assert found, "event 自带可读标题的 URL 未被回填计划识别"
+
+        # 落库后不该再被计划
+        from digitallife.render import linktitle as LT
+        LT.load_from_db(con)
+        LT.save(con, probe, "真实的视频标题_哔哩哔哩_bilibili", source="event", status="ok")
+        con.commit()
+        todo2 = BET.plan(con)
+        assert probe not in [u for u, _t in todo2], "已回填的仍被列入计划"
+    finally:
+        con.execute("DELETE FROM link_title WHERE url=?", (probe,))
+        con.execute("DELETE FROM event WHERE url=?", (probe,))
+        con.commit()
+        left = con.execute(
+            "SELECT COUNT(*) FROM link_title WHERE url=?", (probe,)).fetchone()[0]
+        con.close()
+        assert left == 0, "测试残留未清理（S16）"
+
+
+def test_bilibili_video_url_renders_db_title():
+    """构造性回归：bilibili 视频页在回填后必须由 resolve() 走 'db' 来源，
+    而不是退化成 'bilibili.com · BVxxx'（验收项 2 的机器可验版本）。"""
+    import sqlite3
+    from digitallife import paths
+    from digitallife.render import linktitle as LT
+
+    probe = "http://bili-render-probe.example/video/BVprobe999"
+    con = sqlite3.connect(str(paths.db_path()))
+    con.row_factory = sqlite3.Row
+    try:
+        con.execute("DELETE FROM link_title WHERE url=?", (probe,))
+        # 回填前：无记录 -> 应退化成 url 来源
+        LT.load_from_db(con)
+        before, before_src = LT.resolve("", probe)
+        assert before_src == "url", "回填前应走 url 来源，实际 %s" % before_src
+        assert "·" in before, "回填前应是「域名 · 路径」形态，实际 %r" % before
+
+        # 回填后：应走 db 来源
+        LT.save(con, probe, "真实的视频标题_哔哩哔哩_bilibili",
+                source="event", status="ok")
+        con.commit()
+        LT.load_from_db(con)
+        after, after_src = LT.resolve("", probe)
+        assert after_src == "db", "回填后应走 db 来源，实际 %s" % after_src
+        assert after == "真实的视频标题_哔哩哔哩_bilibili"
+        assert after != before
+    finally:
+        con.execute("DELETE FROM link_title WHERE url=?", (probe,))
+        con.commit()
+        con.close()

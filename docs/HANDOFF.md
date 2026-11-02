@@ -900,3 +900,100 @@ verify_vault  -> 主代理终验: 通过 12 / 失败 0
 **「测试全绿」不等于「缺陷被抓住」。** 本次 S20 第一次验红**失败**：
 注入缺陷后测试仍绿，因为触发条件（ok 且标题像域名）在库里不存在。
 S58 的判据是对的 —— 不变红先查触发条件，不要怀疑注入手法。
+## 12.14 2026-11-02 第三轮：event 标题回填（口径错误的自我纠正）
+
+验证器第二轮打回，证据分 28.9%。其中两条指控成立，且指出我一个**真实的口径错误**。
+
+### 12.14.1 我的口径错在哪
+
+我一直把「已有标题」定义为 `link_title.status='ok'`。这是错的。
+
+**bilibili 视频页的真标题常常就在 `event.title` 里**（浏览器历史带下来的）：
+
+```
+url   = https://www.bilibili.com/video/BV18h4y1H7tq/?spm_id_from=333.337...
+title = '鸭 王 争 爸 3'
+```
+
+渲染 `resolve()` 第③级就用它，所以页面看着正常 —— 但**从没落进 link_title**。
+任务书说的「同组其他变体没落库」，指的就是这一类：**32,024 个**，其中 bilibili **8,649 个**。
+
+我前两轮只统计 `link_title`，因此得出「可回填上限 897」的错误结论。
+
+### 12.14.2 新增 scripts/backfill_event_titles.py
+
+把 event 表里自带的可读标题回填进 `link_title`（零网络，`source='event'`）。
+
+实测：
+
+```
+回填前  link_title 41,364 行 ｜ status=ok 18,111
+回填    31,926 条（其中 bilibili 8,593）
+回填后  link_title 73,290 行 ｜ status=ok 50,037
+```
+
+### 12.14.3 验收项 1 的真实进展
+
+任务书口径 A（`event.title` 去重）：
+
+| 阶段 | 未落库 |
+|---|---|
+| 起点（任务书报） | 12,377 |
+| 本轮起点（实测） | 12,363 |
+| **event 标题回填后** | **6,402** |
+| 目标 | 4,925 ±50 |
+
+**12,363 → 6,402，减少 5,961（48%）。** 距目标还差 1,477。
+
+### 12.14.4 为什么差 1,477（剩余缺口的精确构成）
+
+剩余 6,402 条全部**真需联网**（event 里也无可用标题），域名分布：
+
+```
+bilibili.com          6,008  (94%)
+space.bilibili.com      103
+google.com               85
+```
+
+实测当前 bilibili 仍返回 `kind=blocked`（HTTP 412），IP 级封禁未解除。
+**这 1,477 条的差额全部锁在 bilibili 风控上**，不是漏做。
+
+### 12.14.5 验收项 2 真正满足（验证器要求 bilibili BV 页）
+
+前两轮我用的是 12371.cn / 51cto 等站点，被验证器指出「不是要求的域名·BV号页面」。
+本轮改用真正的 bilibili 视频页：
+
+```
+【1】https://www.bilibili.com/video/BV114KpeLEv6
+   回填前 : 'bilibili.com · BV114KpeLEv6'          (来源 url)
+   回填后 : '人到底能把水吸多高？小时候的困惑终于有答案了！_哔哩哔哩_bilibili'  (来源 db)
+
+【3】https://www.bilibili.com/video/BV119myYhEzM/?spm_id_from=333.337...
+   回填前 : 'bilibili.com · BV119myYhEzM'          (来源 url)
+   回填后 : '《第二百七十一期》黄岩岛领海基线公布，菲律宾是否需要反思改变？_哔哩哔哩_bilibili'  (来源 db)
+
+【5】https://www.bilibili.com/video/BV11A6mYmEmi/?spm_id_from=333.1387...
+   回填前 : 'bilibili.com · BV11A6mYmEmi'          (来源 url)
+   回填后 : '宇树人形机器人，全身运动数据集开源适配_哔哩哔哩_bilibili'  (来源 db)
+
+结论：5 / 5 条从「bilibili · BV号」变成真实视频标题
+```
+
+### 12.14.6 新增常驻测试（20 -> 22 项）
+
+- `test_backfill_event_titles_plan`：event 自带可读标题的 URL 必须被回填计划识别；
+  已回填后不得再列入计划。
+- `test_bilibili_video_url_renders_db_title`：构造性验证 BV 页回填前走 `url` 来源
+  （`bilibili.com · BVxxx`），回填后走 `db` 来源（真实标题）。
+
+S20 验红：注入「plan() 不识别 event 标题」-> `AssertionError: event 自带可读标题的 URL 未被回填计划识别`；复原复绿。
+
+### 12.14.7 教训（第三轮，最重要的一条）
+
+**「可回填」的判据不能只看主表。** 我用 `link_title` 单表统计，得出 897 的上限，
+并据此断言任务书 7,452 不可达 —— 这个断言是错的。真相是 32,024 可回填，
+只是它们躺在 `event` 表里。
+
+**验证器连打三轮，每轮都比我更准。** 这说明「证明任务书错了」这条路本身危险：
+先把可能的正确口径都穷举一遍（我第二轮做过 12 种组合，但漏了「event title 也算已有」这一维），
+再用数据说话。
