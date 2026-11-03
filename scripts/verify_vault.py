@@ -223,6 +223,48 @@ def link_title_check(con: sqlite3.Connection) -> None:
         ck('link_title 表有数据（标题入库而非磁盘缓存）', False, exc)
 
 
+def migration_check(fast: bool = True) -> None:
+    """schema 迁移安全检查（2026-11-03 新增）。
+
+    fast=True：只验**当前库的结构**是否达标（秒级，不动副本）。
+    fast=False：额外跑 `scripts/check_migration.py`，在真实库副本上
+                完整验证「迁移不丢数据」（约 35s，会临时复制 870 MB 到系统临时目录，
+                结束自动清理）。
+
+    为什么要分两档：日常迭代要秒级反馈，改 schema 后才需要全量验证。
+    判据同源（都以 SCHEMA_VERSION 与计数守恒为准），只是深度不同。
+    """
+    import subprocess
+    from digitallife.ingest.schema import SCHEMA_VERSION, current_version
+
+    con = sqlite3.connect(
+        'file:' + str(paths.db_path()).replace(chr(92), '/') + '?mode=ro', uri=True)
+    try:
+        ver = current_version(con)
+        ck('schema_version 达到 %d' % SCHEMA_VERSION, ver >= SCHEMA_VERSION, '实测 %s' % ver)
+        cols = [r[1] for r in con.execute('PRAGMA table_info(link_title)')]
+        ck('link_title 有 failure_kind 列（v3 迁移已应用）',
+           'failure_kind' in cols, cols)
+        ck('link_title 有 attempts 列', 'attempts' in cols, cols)
+    except sqlite3.OperationalError as exc:
+        ck('schema 结构检查', False, exc)
+        con.close()
+        return
+    finally:
+        try:
+            con.close()
+        except Exception:  # noqa: BLE001
+            pass
+
+    if fast:
+        return
+    # 全检：真实副本上跑迁移（必须 --full 才做，35s 且临时占 870MB）
+    r = subprocess.run([sys.executable, 'scripts/check_migration.py', '--quiet'],
+                       cwd=str(ROOT), capture_output=True, text=True,
+                       encoding='utf-8', errors='replace', timeout=600)
+    ok = (r.returncode == 0)
+    ck('迁移验证：副本上跑 init_db 不丢数据', ok, (r.stdout or '')[-300:])
+
 def linkhealth_checks(fast: bool = True) -> None:
     """链路健康检测段（2026-11-02 新增）。
 
@@ -292,6 +334,8 @@ def main() -> int:
         slice_pages_check(slice_dir, con)
         print('== 5. 链接标题入库 ==')
         link_title_check(con)
+        print('== 5b. schema 迁移安全 ==')
+        migration_check(fast=args.fast)
         print('== 6. 链路健康（通用检测内核）==')
         con.close()          # linkhealth 自己开连接（只读开关不同）
         linkhealth_checks(fast=args.fast)

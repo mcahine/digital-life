@@ -17,7 +17,7 @@ cd 01-Projects/digital-life
 export PYTHONUTF8=1 && unset DL_DB DL_WORK_DIR DL_PUBLISH_ALL_SLICES
 python -m pytest                          # 期望 65 passed
 python scripts/smoke.py                   # 期望末行「通过 213 / 失败 0」
-python scripts/verify_vault.py --fast     # 期望「主代理终验: 通过 20 / 失败 0」
+python scripts/verify_vault.py --fast     # 期望「主代理终验: 通过 23 / 失败 0」
 python scripts/check_linkhealth.py        # 期望「链路健康 | 快检 | 通过」
 ```
 
@@ -263,7 +263,7 @@ python scripts/rebuild_daily.py --llm --days 2026-06-09 2026-06-15 --workers 1
 | **W1** | N1 的 <300 KB 未达成 | **用户改判「单页不限大小」**，指标作废 |
 | **W2** | `publish.py` 片层设备名仍是「电脑」 | 片层 11,025 篇「· 电脑」= **0**，D-001 17,210 次 |
 | **W3** | N6 尾部未清 | 27 rename 已提交（`08dbc2d`）；文档 143 处旧路径改净 |
-| **W5(L3)** | T5 tmp 治理 | 518 MB → 13 MB；17 `.bak` 完好。<br>⚠️ **2026-11-03 复核：tmp 现为 883.9 MB**，因 `a2_migrate_test.sqlite`（870 MB）残留，见 §13.4 |
+| **W5(L3)** | T5 tmp 治理 | 518 MB → 13 MB；17 `.bak` 完好。<br>2026-11-03 曾涨到 883.8 MB（`a2_migrate_test.sqlite` 残留 870 MB），**已清理回 13.6 MB**，并换成自动清理的 `scripts/check_migration.py`（§13.4）|
 
 ### 5.2 仍在办的
 
@@ -1087,7 +1087,7 @@ python scripts/check_linkhealth.py --diff A B   # 对拍两份报告
 ```
 == 6. 链路健康（通用检测内核）==
 [linkhealth] counts: {...}
-主代理终验: 通过 20 / 失败 0      ← 从 12 项增到 20 项，出口不变
+主代理终验: 通过 23 / 失败 0      ← 从 12 项增到 23 项（+迁移 3 + 检测 8），出口不变
 ```
 
 分工明确：
@@ -1138,7 +1138,7 @@ coverage.ok_title_urls         50037          50037            0
 ```
 pytest        -> 65 passed（原 34 + 抓取治理 22 + 检测 9）
 smoke         -> 通过 213 / 失败 0
-verify_vault  -> 主代理终验: 通过 20 / 失败 0（第 6 段新增 8 项）
+verify_vault  -> 主代理终验: 通过 23 / 失败 0（5b 迁移段 3 项 + 第 6 段检测 8 项）
 ```
 
 ---
@@ -1174,7 +1174,7 @@ verify_vault  -> 主代理终验: 通过 20 / 失败 0（第 6 段新增 8 项�
 | 项 | 旧值 | 新值【实测】 |
 |---|---|---|
 | pytest | 34 passed | **65 passed** |
-| verify_vault | 12 通过 | **20 通过**（第 6 段 linkhealth 新增 8 项）|
+| verify_vault | 12 通过 | **23 通过**（新增 5b 迁移段 3 项 + 第 6 段 linkhealth 8 项）|
 | 叙事 >=800 字 | 138 天 | **142 天** |
 | 叙事偏短 | 4 天 | **0 天** |
 | 叙事总字数 | 123.4 万 | **255.9 万字** |
@@ -1183,7 +1183,7 @@ verify_vault  -> 主代理终验: 通过 20 / 失败 0（第 6 段新增 8 项�
 | HEAD | 6f178af | **3de4ad7** |
 | 测试网文件 | 6 个 | **7 个** |
 | link_title | 3,229 行 | **73,291 行**（ok 50,038）|
-| tmp 体积 | 13 MB | **883.9 MB**（见 §13.4）|
+| tmp 体积 | 13 MB | 曾涨到 883.8 MB，**已清理回 13.6 MB**（见 §13.4）|
 
 ### 13.4 tmp 体积暴涨的真因：一个 870 MB 残留副本
 
@@ -1212,16 +1212,39 @@ verify_vault  -> 主代理终验: 通过 20 / 失败 0（第 6 段新增 8 项�
 | **删** | 可随时由 `python tmp/a2_migrate_test.py` 重新生成；tmp 已被 .gitignore 排除 |
 | **留** | 占用 870 MB；下次跑该脚本会先删再建，不影响正确性 |
 
-**当前状态：未删，等拍板。** 若要清理：
+**当前状态：已解决（2026-11-03）**
 
-```bash
-rm -f tmp/a2_migrate_test.sqlite tmp/a2_migrate_test.sqlite-wal tmp/a2_migrate_test.sqlite-shm
+- 残留副本已删除：tmp **883.8 MB → 13.6 MB**（17 个 `.bak` 完好未动）
+- 旧的 `tmp/a2_migrate_test.py` 已删除（它在 tmp/ 里，gitignore 排除，修好也进不了版本库）
+- **替代物**：`scripts/check_migration.py`（正式工具，进版本库）
+
+**新工具的三条防线**（实测验证）：
+
+| 场景 | 行为 |
+|---|---|
+| 正常跑完 | 8 项断言 + 自动清理，残留 **0** |
+| 抛异常 / Ctrl-C | `finally` 清理，残留 **0** |
+| `kill -9` 强杀 | 无法拦截（870 MB 会留），但**下次启动自动清**（见下）|
+
+**强杀残骸的清理判据**：不是看文件多老，而是**看属主 PID 还活不活**。
+
+```python
+# 文件名带 PID：dl-migrate-<pid>-xxxx.sqlite
+if not _pid_alive(owner):   # 进程已死 -> 立刻删
+    os.unlink(f)
 ```
 
-**不要动 `tmp/*.bak`（17 个，S41 唯一副本）。**
+实测：8 秒 SIGKILL 留下 870 MB，紧接着重跑输出
+`[note] 清理了上次中断遗留的 3 个临时文件`，残留归 **0**。
 
-**建议**：给 `a2_migrate_test.py` 加 try/finally 保证清理，
-或改成复制到系统临时目录而非项目 tmp/。
+> 最初只按「文件年龄 > 10 分钟」判断，导致强杀残骸白占一小时 —— 实测发现后改为存活性判据。
+> Windows 的 %TEMP% 不会自动清，这个兜底是必需的。
+
+**用法**：
+```bash
+python scripts/check_migration.py                     # 验证后自动清理
+python scripts/check_migration.py --keep d:/x.sqlite  # 显式保留副本
+```
 
 ### 13.5 叙事状态复核命令（可重放）
 
@@ -1280,8 +1303,15 @@ export PYTHONUTF8=1 && unset DL_DB DL_WORK_DIR DL_PUBLISH_ALL_SLICES
 
 python -m pytest                        # 期望 65 passed
 python scripts/smoke.py                 # 期望「通过 213 / 失败 0」
-python scripts/verify_vault.py --fast   # 期望「主代理终验: 通过 20 / 失败 0」
+python scripts/verify_vault.py --fast   # 期望「主代理终验: 通过 23 / 失败 0」
 python scripts/check_linkhealth.py      # 期望「链路健康 | 快检 | 通过」
 ```
 
-**四条全绿才算环境正常。** 第三条从 12 项涨到 20 项，是因为并入了 linkhealth 段（§12.15.5）。
+**全绿才算环境正常。** 第三条从 12 项涨到 23 项，是因为并入两段：
+`5b. schema 迁移安全`（3 项）+ `6. 链路健康`（8 项）。
+
+**schema 改动后必须额外跑**（约 30s，在真实库副本上验证迁移不丢数据）：
+
+```bash
+python scripts/check_migration.py
+```
