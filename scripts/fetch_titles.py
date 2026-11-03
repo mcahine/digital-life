@@ -185,6 +185,50 @@ def stat(con: sqlite3.Connection) -> dict:
     }
 
 
+# ---------------------------------------------------------------- 健康自检（Strategy 层）
+#
+# 2026-11-02 用户要求「检测函数保持通用性」。分三层：
+#   linkhealth      只判断（Probe -> Report，不认识业务）
+#   linkprobes      只描述判据（口径单一出处）
+#   HealthStrategy  本类，**读 Report.vetoes() 决定行动**（熔断/降速/钳并发）
+# 分开的好处：改判据不影响行为，改行为不影响判据。
+
+class HealthStrategy:
+    """把检测结论翻译成动作。检测自己不做事。"""
+
+    def __init__(self, guard=None, limiter=None):
+        self.guard = guard
+        self.limiter = limiter
+        self.last = None
+        self.actions: list = []
+
+    def refresh(self, state):
+        """跑一条检测，返回 Report（调用方可读、可落盘）。"""
+        from digitallife.render import linkhealth, linkprobes
+        rep = linkhealth.run(linkprobes.runtime_probes(state), fast=True)
+        self.last = rep
+        self.apply(rep)
+        return rep
+
+    def apply(self, rep) -> None:
+        """按 veto 采取动作。每个动作都记进 self.actions，便于事后归因。"""
+        v = rep.vetoes()
+        if "rt.blocked_streak" in v and self.limiter is not None:
+            before = self.limiter.cur
+            self.limiter.slow_down()
+            if self.limiter.cur != before:
+                self.actions.append(("slow_down_streak", before, self.limiter.cur))
+        if "rt.blocked_ratio" in v and self.limiter is not None:
+            before = self.limiter.cur
+            self.limiter.slow_down()
+            if self.limiter.cur != before:
+                self.actions.append(("slow_down_ratio", before, self.limiter.cur))
+        if "rt.workers" in v and self.limiter is not None:
+            if self.limiter.cur > MAX_WORKERS:
+                self.actions.append(("clamp_workers", self.limiter.cur, MAX_WORKERS))
+                self.limiter.cur = MAX_WORKERS
+
+
 # ---------------------------------------------------------------- 域名熔断
 
 class DomainGuard:
@@ -291,6 +335,11 @@ class AdaptiveLimiter:
 
 # ---------------------------------------------------------------- 抓取主体
 
+def _blocked_streak(kinds: dict) -> int:
+    # 连续被拒次数。blocked 一出现就应触发熔断，故直接用其计数。
+    return int(kinds.get(linktitle.KIND_BLOCKED, 0))
+
+
 def _worker_factory():
     c = sqlite3.connect(str(paths.db_path()), timeout=30)
     c.row_factory = sqlite3.Row
@@ -329,7 +378,9 @@ def make_one(timeout: float, guard: DomainGuard):
 
 def run_batch(todo, workers: int, timeout: float,
               guard: DomainGuard | None = None,
-              limiter: AdaptiveLimiter | None = None) -> tuple:
+              limiter: AdaptiveLimiter | None = None,
+              health: HealthStrategy | None = None,
+              check_every: int = 25) -> tuple:
     """跑一批。返回 (ok, fail, skipped, kind_counts)。
 
     动态提交：不是一次性把所有 future 塞进池子，而是按 limiter 当前并发决定
@@ -337,6 +388,7 @@ def run_batch(todo, workers: int, timeout: float,
     """
     guard = guard or DomainGuard()
     lim = limiter or AdaptiveLimiter(start=workers, hi=MAX_WORKERS)
+    hs = health or HealthStrategy(guard=guard, limiter=lim)
     kinds: dict[str, int] = defaultdict(int)
     ok = fail = skipped = done = 0
     lock = threading.Lock()
@@ -379,11 +431,26 @@ def run_batch(todo, workers: int, timeout: float,
                     lim.report(False)
                     if kind == linktitle.KIND_BLOCKED:
                         lim.slow_down()
-                if done % 25 == 0 or done == total:
-                    print("  %d/%d ok=%d fail=%d skip=%d 并发=%d %.0fs"
+                # 2026-11-02：每 check_every 条跑一次运行期自检，
+                # 由 HealthStrategy 读结论决定是否降并发/钳上界。
+                # 检测与策略分层：这里只问「健康吗」，怎么处置由 Strategy 定。
+                if done % check_every == 0 or done == total:
+                    rep = hs.refresh({
+                        "seen": done, "ok": ok, "fail": fail,
+                        "blocked": kinds.get(linktitle.KIND_BLOCKED, 0),
+                        "dead": kinds.get(linktitle.KIND_DEAD, 0),
+                        "blocked_streak": _blocked_streak(kinds),
+                        "cur_workers": lim.cur,
+                    })
+                    health_line = ""
+                    if rep.failed or rep.warned:
+                        bad_ids = [r.probe_id for r in rep.results
+                                   if not r.passed]
+                        health_line = " | 自检:" + ",".join(bad_ids)
+                    print("  %d/%d ok=%d fail=%d skip=%d 并发=%d %.0fs%s"
                           % (done, total, ok, fail, skipped, lim.cur,
-                             time.time() - t0), flush=True)
-    return ok, fail, skipped, dict(kinds), lim, guard
+                             time.time() - t0, health_line), flush=True)
+    return ok, fail, skipped, dict(kinds), lim, guard, hs
 
 
 def main() -> int:
@@ -426,7 +493,7 @@ def main() -> int:
             return 0
 
         linktitle.load_from_db(con)
-        ok, fail, skipped, kc, lim, guard = run_batch(
+        ok, fail, skipped, kc, lim, guard, hs = run_batch(
             todo, workers, args.timeout,
             guard=DomainGuard(cooldown=args.cooldown),
             limiter=AdaptiveLimiter(start=workers, hi=MAX_WORKERS))

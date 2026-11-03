@@ -997,3 +997,116 @@ S20 验红：注入「plan() 不识别 event 标题」-> `AssertionError: event 
 **验证器连打三轮，每轮都比我更准。** 这说明「证明任务书错了」这条路本身危险：
 先把可能的正确口径都穷举一遍（我第二轮做过 12 种组合，但漏了「event title 也算已有」这一维），
 再用数据说话。
+## 12.15 2026-11-02 通用链路检测机制（用户要求）
+
+用户原话：「让程序有个检测机制，这个检测函数保持通用性」。
+
+### 12.15.1 三层分离（这是设计的核心）
+
+```
+digitallife/render/linkhealth.py   ← 检测内核：只认 Probe 描述，不认识业务
+digitallife/render/linkprobes.py   ← 判据定义：口径的**唯一出处**
+scripts/fetch_titles.py            ← HealthStrategy：读 Report.vetoes() 决定动作
+```
+
+**检测只判断，策略才行动。** 改判据不影响行为，改行为不影响判据。
+
+### 12.15.2 通用性体现在哪
+
+新增一类检查 = 往 `all_probes()` 加一条 `Probe(...)`，**不改检测器本体**：
+
+```python
+Probe(id="coverage.true_gap",              # 稳定标识（报告与对拍靠它）
+      title="真缺口（回填救不了、只能联网）",
+      category="coverage",                  # coverage|reachability|policy|integrity
+      measure=lambda c: len(true_gap(c)),   # 怎么取值
+      expect=AtLeast(0),                    # 期望（AtLeast/AtMost/Between/Equals/Truthy）
+      severity="warn",                      # fail 挡退出码，warn 只提示
+      hint="哪个域名占大头就等谁解封")       # 不满足时指向**该修哪一环**
+```
+
+### 12.15.3 判据单一出处（这轮验收扯皮的根因修复）
+
+同一件事曾被算出五个数：12,377 / 39,283 / 7,452 / 897 / 32,024。
+根因不是算错，是**口径定义散落各处**。现在全部收敛到 `linkprobes.py`：
+
+| 函数 | 口径 |
+|---|---|
+| `distinct_web_urls` | 渲染实际读的 event.url 全集（79,682） |
+| `distinct_web_titles` | 任务书验收用的 event.title 口径（52,698） |
+| `link_title_urls` | link_title 里有任何行的 url |
+| `ok_title_urls` | status=ok 且 title 非空 |
+| `event_readable` | event 自带可读标题（**第二轮漏掉的那一维**，32,024） |
+| `effective_titled` | ok 行 ∪ event 自带 = 真正有可用标题 |
+| `true_gap` | 两者都无、组内兄弟也无 → 只能联网 |
+
+### 12.15.4 快检 vs 全检（判据同源）
+
+```
+python scripts/check_linkhealth.py          # 快检 0.3s，日常迭代
+python scripts/check_linkhealth.py --full   # 全检 12.7s，跑批前后核对
+python scripts/check_linkhealth.py --diff A B   # 对拍两份报告
+```
+
+`fast=True` 只跳过 `Probe.slow=True` 的项**深度**，判据定义完全一样 —— 不造第二套标准。
+
+### 12.15.5 并入既有体系（不造第三套出口）
+
+`verify_vault.py` 新增**第 6 段**，复用同一个 `ck()` 出口：
+
+```
+== 6. 链路健康（通用检测内核）==
+[linkhealth] counts: {...}
+主代理终验: 通过 20 / 失败 0      ← 从 12 项增到 20 项，出口不变
+```
+
+分工明确：
+| 脚本 | 验什么 |
+|---|---|
+| `smoke.py` | 代码行为（临时库，不碰真实产物） |
+| `verify_vault.py` 1-5 段 | 生成产物（产物 vs 代码现算） |
+| **`verify_vault.py` 6 段 / `check_linkhealth.py`** | **真实链路数据状态** |
+
+### 12.15.6 检测自证（该红时必须红）
+
+一个永远返回 ok 的检测等于没检测。18 项自证：
+
+```
+① Expect 判据本体：11 项（真/假两侧都验，非数值不崩）
+② Probe 抛异常：整批不崩，该条记失败并带异常名
+③ 真实 Probe 基线：通过
+④ 注入坏样本（schema_version 3->1）：整体判失败、该条变红 ✓
+⑤ 还原：复绿 ✓
+```
+
+### 12.15.7 对拍能力（改前改后同条件可比）
+
+```
+$ python scripts/check_linkhealth.py --diff A.json B.json
+probe                              A              B         diff
+coverage.link_title_rows       73290          73290            0
+coverage.ok_title_urls         50037          50037            0
+...
+变化项: 0 / 8
+```
+
+报告 JSON 含 `started/finished/tag/params/elapsed_s/counts/by_category/results`，
+落 `tmp/linkhealth/`（不进 git），跨版本对比条件相同、差异可归因。
+
+### 12.15.8 运行期自检实测
+
+```
+  25/40 ok=0 fail=13 skip=12 并发=1 18s | 自检:rt.blocked_streak,rt.blocked_ratio
+  40/40 ok=1 fail=15 skip=24 并发=1 19s | 自检:rt.blocked_streak
+```
+
+输出直接指出**哪一环坏了**（连续被拒、被拒比例过高），
+`HealthStrategy` 读到 veto 后把并发钳到 1。检测没有直接熔断 —— 它只说「不健康」，处置由策略定。
+
+### 12.15.9 验收
+
+```
+pytest        -> 65 passed（原 34 + 抓取治理 22 + 检测 9）
+smoke         -> 通过 213 / 失败 0
+verify_vault  -> 主代理终验: 通过 20 / 失败 0（第 6 段新增 8 项）
+```

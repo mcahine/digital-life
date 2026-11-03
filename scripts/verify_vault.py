@@ -223,6 +223,49 @@ def link_title_check(con: sqlite3.Connection) -> None:
         ck('link_title 表有数据（标题入库而非磁盘缓存）', False, exc)
 
 
+def linkhealth_checks(fast: bool = True) -> None:
+    """链路健康检测段（2026-11-02 新增）。
+
+    为什么放在这里而不是新造一个脚本：
+      smoke.py 验**代码行为**（临时库，不碰真实产物）
+      verify_vault.py 验**生成产物**（产物 vs 代码现算）
+      本段验**真实链路的数据状态**（库里到底有多少标题、缺口多大、哪个站挡我们）
+    三者对象不同、互不替代，但走**同一个绿/红出口**，验收时只看这一处的末行。
+
+    判据定义在 digitallife/render/linkprobes.py（单一出处），
+    检测内核在 digitallife/render/linkhealth.py（不认识业务）。
+    --fast 时跳 slow 项：只跑秒级计数，不遍历大集合。
+    """
+    import sqlite3
+    from digitallife.render import linkhealth as _LH
+    from digitallife.render import linkprobes as _LP
+
+    con = sqlite3.connect(str(paths.db_path()))
+    con.row_factory = sqlite3.Row
+    try:
+        rep = _LH.run(_LP.all_probes(), ctx=con, fast=fast, tag="verify")
+        for r in rep.results:
+            if r.passed:
+                ck("[linkhealth] %s" % r.probe_id, True, "")
+            elif r.severity == "fail":
+                ck("[linkhealth] %s" % r.probe_id, False,
+                   "value=%r expect=%s %s" % (r.value, r.expect, r.hint))
+            else:
+                # warn/info 不计失败，但仍打印，便于人工看
+                print("[note] %s = %r (期望 %s)%s"
+                      % (r.probe_id, r.value, r.expect,
+                         ("  -> " + r.hint) if r.hint else ""))
+        # 关键计数单独打一遍，供前后对拍
+        print("[linkhealth] counts: %s" % rep.counts())
+        try:
+            p = _LH.log_report(rep, name="verify")
+            print("[linkhealth] 日志: %s" % p)
+        except Exception as exc:  # noqa: BLE001
+            print("[linkhealth] 日志落盘失败: %s" % exc)
+    finally:
+        con.close()
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument('--fast', action='store_true', help='跳过 753 天全量对拍')
@@ -249,6 +292,12 @@ def main() -> int:
         slice_pages_check(slice_dir, con)
         print('== 5. 链接标题入库 ==')
         link_title_check(con)
+        print('== 6. 链路健康（通用检测内核）==')
+        con.close()          # linkhealth 自己开连接（只读开关不同）
+        linkhealth_checks(fast=args.fast)
+        con = sqlite3.connect('file:' + str(paths.db_path()).replace(chr(92), '/')
+                              + '?mode=ro', uri=True)
+        con.row_factory = sqlite3.Row
     finally:
         con.close()
 

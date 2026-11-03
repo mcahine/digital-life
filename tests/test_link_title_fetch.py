@@ -380,3 +380,162 @@ def test_bilibili_video_url_renders_db_title():
         con.execute("DELETE FROM link_title WHERE url=?", (probe,))
         con.commit()
         con.close()
+
+# ---------------------------------------------------------------- 7. 通用检测内核（linkhealth）
+
+def test_expect_all_kinds_judge_correctly():
+    """判据本体自证：每种 Expect 都能判对，也能判错。
+
+    一个永远返回 ok 的检测等于没检测 —— 这里逐条验证「该红时真红」。
+    """
+    from digitallife.render.linkhealth import (
+        AtLeast, AtMost, Between, Equals, Truthy,
+    )
+
+    assert AtLeast(5).check(10)[0] is True
+    assert AtLeast(5).check(3)[0] is False
+    assert AtMost(5).check(3)[0] is True
+    assert AtMost(5).check(10)[0] is False
+    assert Between(1, 12).check(6)[0] is True
+    assert Between(1, 12).check(20)[0] is False
+    assert Equals("a").check("a")[0] is True
+    assert Equals("a").check("b")[0] is False
+    assert Truthy().check(1)[0] is True
+    assert Truthy().check(0)[0] is False
+    # 非数值输入不得抛异常，应判假
+    assert AtLeast(1).check("abc")[0] is False
+
+
+def test_probe_exception_does_not_break_batch():
+    """单条 Probe 抛异常时，整批不崩，该条记失败并带异常名。"""
+    from digitallife.render.linkhealth import AtLeast, Probe, run
+
+    bad = Probe(id="t.boom", title="故意抛", category="integrity",
+                measure=lambda c: 1 / 0, expect=AtLeast(1), severity="fail")
+    good = Probe(id="t.ok", title="正常", category="integrity",
+                 measure=lambda c: 5, expect=AtLeast(1), severity="fail")
+    rep = run([bad, good], fast=True)
+    assert len(rep.results) == 2
+    assert rep.results[0].passed is False
+    assert "ZeroDivisionError" in rep.results[0].detail
+    assert rep.results[1].passed is True          # 后面的照常跑
+
+
+def test_fast_skips_slow_probes():
+    """快检跳过 slow 项，全检包含 —— 判据同源，深度不同。"""
+    from digitallife.render.linkhealth import Probe, Truthy, run
+
+    slow = Probe(id="t.slow", title="慢项", category="coverage",
+                 measure=lambda c: 1, expect=Truthy(), slow=True)
+    fast_p = Probe(id="t.fast", title="快项", category="coverage",
+                   measure=lambda c: 1, expect=Truthy(), slow=False)
+
+    r_fast = run([slow, fast_p], fast=True)
+    ids_fast = {r.probe_id for r in r_fast.results}
+    assert "t.slow" not in ids_fast
+    assert "t.fast" in ids_fast
+
+    r_full = run([slow, fast_p], fast=False)
+    ids_full = {r.probe_id for r in r_full.results}
+    assert "t.slow" in ids_full
+    assert "t.fast" in ids_full
+
+
+def test_report_vetoes_is_structured():
+    """vetoes() 给出结构化结论供 Strategy 读 —— 检测自己不做事。"""
+    from digitallife.render.linkhealth import AtLeast, AtMost, Probe, run
+
+    ps = [
+        Probe(id="a.low", title="不够", category="coverage",
+              measure=lambda c: 1, expect=AtLeast(10), severity="fail",
+              hint="该补数据"),
+        Probe(id="a.fine", title="够", category="coverage",
+              measure=lambda c: 100, expect=AtLeast(10), severity="fail"),
+    ]
+    rep = run(ps, fast=True)
+    v = rep.vetoes()
+    assert "a.low" in v
+    assert "a.fine" not in v
+    assert v["a.low"]["hint"] == "该补数据"
+    assert rep.passed is False
+
+
+def test_warn_does_not_affect_passed():
+    """warn 级不通过不影响整体 passed（只有 fail 级才挡）。"""
+    from digitallife.render.linkhealth import AtLeast, Probe, run
+
+    ps = [
+        Probe(id="w.x", title="警告项", category="coverage",
+              measure=lambda c: 0, expect=AtLeast(5), severity="warn"),
+        Probe(id="f.y", title="失败项", category="integrity",
+              measure=lambda c: 10, expect=AtLeast(5), severity="fail"),
+    ]
+    rep = run(ps, fast=True)
+    assert rep.passed is True                 # warn 不挡
+    assert len(rep.warned) == 1
+    # 一旦 fail 级也坏，就挡
+    ps[1] = Probe(id="f.y", title="失败项", category="integrity",
+                  measure=lambda c: 1, expect=AtLeast(5), severity="fail")
+    assert run(ps, fast=True).passed is False
+
+
+def test_counts_are_comparable_across_runs():
+    """counts() 结构稳定 —— 改动前后能直接对拍。"""
+    from digitallife.render.linkhealth import run
+    from digitallife.render import linkprobes
+
+    import sqlite3
+    from digitallife import paths
+
+    con = sqlite3.connect(str(paths.db_path()))
+    con.row_factory = sqlite3.Row
+    try:
+        r1 = run(linkprobes.all_probes(), ctx=con, fast=True)
+        r2 = run(linkprobes.all_probes(), ctx=con, fast=True)
+    finally:
+        con.close()
+    assert set(r1.counts()) == set(r2.counts())
+    assert r1.counts() == r2.counts()          # 同条件两次取值相同
+
+
+def test_runtime_probes_flag_bad_state():
+    """运行期探针：并发越界/被拒过多时必须给出 veto。"""
+    from digitallife.render.linkhealth import run
+    from digitallife.render import linkprobes
+
+    bad = {"seen": 100, "blocked": 40, "dead": 5,
+           "cur_workers": 20, "blocked_streak": 6}
+    rep = run(linkprobes.runtime_probes(bad), fast=True)
+    v = rep.vetoes()
+    assert "rt.workers" in v            # 并发 20 越界
+    assert "rt.blocked_streak" in v     # 连续被拒 6 > 3
+    assert "rt.blocked_ratio" in v      # 0.4 > 0.3
+    assert rep.passed is False
+
+    good = {"seen": 100, "blocked": 1, "dead": 5,
+            "cur_workers": 4, "blocked_streak": 1}
+    assert run(linkprobes.runtime_probes(good), fast=True).passed is True
+
+
+def test_probe_definitions_are_unique():
+    """Probe id 必须唯一 —— 报告与对拍都靠 id。"""
+    from digitallife.render import linkprobes
+
+    ids = [p.id for p in linkprobes.all_probes()]
+    assert len(ids) == len(set(ids)), "Probe id 重复: %s" % ids
+
+
+def test_health_strategy_reads_vetoes_not_decides():
+    """Strategy 读检测结论行动；检测本身不改变任何状态（分层）。"""
+    from digitallife.render.linkhealth import AtLeast, Probe, run
+
+    ps = [Probe(id="rt.workers", title="并发", category="policy",
+                measure=lambda c: 20, expect=AtLeast(0), severity="fail")]
+    rep = run(ps, fast=True)
+    # 检测只产出结论，不动任何外部对象
+    assert rep.vetoes() == {} or "rt.workers" not in rep.vetoes()  # 已通过
+    # 构造一个真的越界的
+    ps2 = [Probe(id="rt.workers", title="并发", category="policy",
+                 measure=lambda c: 20, expect=AtLeast(100), severity="fail")]
+    rep2 = run(ps2, fast=True)
+    assert "rt.workers" in rep2.vetoes()
