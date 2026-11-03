@@ -188,7 +188,7 @@ def test_canon_url_keeps_meaningful_params():
 
 # ---------------------------------------------------------------- 4. 断点续跑（验收项 6）
 
-def test_collect_skips_ok_urls():
+def test_collect_skips_ok_urls(tmpdb):
     """已 status='ok' 的 URL 绝不重回待抓队列。
 
     2026-11-02 验证器发现的真实缺陷：旧写法
@@ -197,13 +197,9 @@ def test_collect_skips_ok_urls():
     它就会掉进待抓队列，于是**每轮都被重抓**。这正是「断点续跑失效」的实质。
     修法：status='ok' 一律跳过，不看 title 是否可用。
     """
-    import sqlite3
-
-    from digitallife import paths
     from scripts import fetch_titles as FT
 
-    con = sqlite3.connect(str(paths.db_path()))
-    con.row_factory = sqlite3.Row
+    con = tmpdb
     try:
         ok_urls = {r[0] for r in con.execute(
             "SELECT url FROM link_title WHERE status='ok' LIMIT 300")}
@@ -245,7 +241,7 @@ def test_fetch_does_not_write_disk_cache():
     after = snap()
     assert before == after, "抓取写入了磁盘缓存: %r -> %r" % (before, after)
 
-def test_collect_skips_ok_even_if_title_looks_like_domain():
+def test_collect_skips_ok_even_if_title_looks_like_domain(tmpdb):
     """构造性回归（S20）：ok 但 title 恰好是域名形态的行，也不得重回待抓。
 
     这是旧实现的真实缺陷：
@@ -259,8 +255,7 @@ def test_collect_skips_ok_even_if_title_looks_like_domain():
     from scripts import fetch_titles as FT
 
     probe = "http://hostlike-probe.example/page?utm_source=x"
-    con = sqlite3.connect(str(paths.db_path()))
-    con.row_factory = sqlite3.Row
+    con = tmpdb
     try:
         con.execute("DELETE FROM link_title WHERE url=?", (probe,))
         con.execute("DELETE FROM event WHERE url=?", (probe,))
@@ -299,7 +294,7 @@ def test_collect_skips_ok_even_if_title_looks_like_domain():
 
 # ---------------------------------------------------------------- 6. event 标题回填（验收项 1/2 核心）
 
-def test_backfill_event_titles_plan():
+def test_backfill_event_titles_plan(tmpdb):
     """event 表自带可读标题、link_title 无 ok 行的 URL，必须能被回填计划识别。
 
     这修正了一个口径错误（2026-11-02 验证器第二轮）：
@@ -310,13 +305,10 @@ def test_backfill_event_titles_plan():
       渲染 resolve() 第③级用它，页面看着正常 —— 但没落进 link_title。
       任务书说的「同组其他变体没落库」正是这一类（32,024 个，含 bilibili 8,649）。
     """
-    import sqlite3
-    from digitallife import paths
     from scripts import backfill_event_titles as BET
 
     probe = "http://event-title-probe.example/video/BVtest123"
-    con = sqlite3.connect(str(paths.db_path()))
-    con.row_factory = sqlite3.Row
+    con = tmpdb
     try:
         con.execute("DELETE FROM link_title WHERE url=?", (probe,))
         con.execute("DELETE FROM event WHERE url=?", (probe,))
@@ -349,16 +341,13 @@ def test_backfill_event_titles_plan():
         assert left == 0, "测试残留未清理（S16）"
 
 
-def test_bilibili_video_url_renders_db_title():
+def test_bilibili_video_url_renders_db_title(tmpdb):
     """构造性回归：bilibili 视频页在回填后必须由 resolve() 走 'db' 来源，
     而不是退化成 'bilibili.com · BVxxx'（验收项 2 的机器可验版本）。"""
-    import sqlite3
-    from digitallife import paths
     from digitallife.render import linktitle as LT
 
     probe = "http://bili-render-probe.example/video/BVprobe999"
-    con = sqlite3.connect(str(paths.db_path()))
-    con.row_factory = sqlite3.Row
+    con = tmpdb
     try:
         con.execute("DELETE FROM link_title WHERE url=?", (probe,))
         # 回填前：无记录 -> 应退化成 url 来源
@@ -479,7 +468,7 @@ def test_warn_does_not_affect_passed():
     assert run(ps, fast=True).passed is False
 
 
-def test_counts_are_comparable_across_runs():
+def test_counts_are_comparable_across_runs(tmpdb):
     """counts() 结构稳定 —— 改动前后能直接对拍。"""
     from digitallife.render.linkhealth import run
     from digitallife.render import linkprobes
@@ -487,8 +476,7 @@ def test_counts_are_comparable_across_runs():
     import sqlite3
     from digitallife import paths
 
-    con = sqlite3.connect(str(paths.db_path()))
-    con.row_factory = sqlite3.Row
+    con = tmpdb
     try:
         r1 = run(linkprobes.all_probes(), ctx=con, fast=True)
         r2 = run(linkprobes.all_probes(), ctx=con, fast=True)
