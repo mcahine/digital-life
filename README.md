@@ -24,17 +24,74 @@
         ↓ publish→ 10-时段/*.md、20-日报/*.md、NDJSON、manifest
 ```
 
-## 当前实况（2026-10-22 实测）
+> ⚠️ **本仓库只含代码，不含数据。**
+> 克隆下来跑 `pytest` 能全绿（测试用临时库），但 `scripts/smoke.py` / `verify_vault.py`
+> 需要**本机生产库**才会真正检查到数据。没有库时它们会跳过或报空 —— **这不是代码坏了**。
+> 详见下方「## 从零 clone 到测试全绿」。
+
+## 当前实况（2026-11-03 实测）
 
 | 指标 | 值 |
 |---|---|
-| 统一事件表 | **1,123,058** 条（manictime 771,802 / iqqz3 203,461 / screenmemo 103,424 / shion 28,805 / tai 15,566）|
-| 按设备 | `pc-main` 816,173 ｜ `phone-1` 306,885 |
-| 时间片 | **96,371** 片（pc-main 33,129 / phone-1 53,064 / phone-2 10,178），15 分钟 UTC 网格，超限递归二分 |
-| 截图守恒 | phone-1 103,424 / pc-main 55,527，与源 `kind='screen'` 完全一致 |
-| 日总结 | **753** 天 |
-| 视觉结果 | `slice_result` **7,819 片**（其中 phone-2 侧 5,940 片，已 100% 完成）|
-| 主回归 | `scripts/smoke.py` **181 项** |
+| 统一事件表 | **1,124,831** 条 |
+| 时间片 | **43,257** 片（15 分钟 UTC 网格，超限递归二分）|
+| 视觉结果 | `slice_result` **9,679** 片 |
+| 日总结 | **753** 天，其中 **143 天**有片层原料、**142 天**达标（≥800 字）|
+| 链接标题 | `link_title` **73,291** 行（ok 50,038）|
+| 生产库 | 870.2 MB（**不入库**，在 `知识库/.data/digital-life/`）|
+| 主回归 | `scripts/smoke.py` **213 项** ｜ `pytest` **65 passed** |
+
+## 从零 clone 到测试全绿
+
+```bash
+git clone https://github.com/mcahine/digital-life.git
+cd digital-life
+
+# 1) 装依赖（Python 3.11+）
+pip install -e .
+pip install pytest httpx            # 测试与抓取需要
+
+# 2) 立即能绿的（不依赖生产库）
+export PYTHONUTF8=1
+python -m pytest                    # 期望 65 passed
+```
+
+**到这里就结束了 —— 其余全部依赖不入库的生产库。**
+
+| 命令 | 需要什么 | 没有时的表现 |
+|---|---|---|
+| `pytest` | 无（用临时库 fixture）| ✅ 直接绿 |
+| `scripts/smoke.py` | 无（强制临时库）| ✅ 直接绿 |
+| `scripts/verify_vault.py --fast` | **生产库 + vault 产物** | ⚠️ 会报空/跳过 |
+| `scripts/check_linkhealth.py` | **生产库** | ⚠️ 打不开库则退出码 2 |
+| `scripts/check_migration.py` | **生产库**（会复制 870 MB 到系统临时目录）| ⚠️ 报「真库不存在」 |
+| `cli daily/publish` | **生产库 + 模型凭据** | ❌ 无法产出日报 |
+
+**要跑全量，你需要自己重建数据链**：
+
+```bash
+# 原始件放 00-Inbox/，然后按顺序：
+python -m digitallife.cli ingest --source manictime --path <zip>
+python -m digitallife.cli ingest --source shion
+python -m digitallife.cli slice  --device pc-main
+python -m digitallife.cli vision --device pc-main     # 需 DL_LLM_* 凭据
+python -m digitallife.cli daily  --date 2026-08-13
+python -m digitallife.cli publish --no-zip
+```
+
+> **数据不可重算**：中间物可删了重跑 `ingest`，但**原始件（00-Inbox）与生成的叙事正文不可逆**。
+> 换机器时请整体备份 `.data/digital-life/`，不要只 clone 代码。
+
+### 环境变量（都不入库）
+
+```bash
+export DL_LLM_BASE_URL="https://token.sensenova.cn/v1/chat/completions"
+export DL_LLM_API_KEY="<你自己的>"
+export DL_LLM_MODEL="sensenova-6.8-flash-lite"
+export DL_LLM_TIMEOUT=240
+```
+
+> 凭据只放环境变量或 `config/llm.json`（已被 .gitignore 排除），**不要写进任何被跟踪的文件**。
 
 ## 五个数据源
 
@@ -68,7 +125,9 @@ python -m digitallife.cli verify
 批量与清理：
 
 ```bash
-python scripts/smoke.py                                      # 181 项主回归
+python scripts/smoke.py                                      # 213 项主回归
+python -m pytest                                              # 65 项单元/回归测试
+python scripts/verify_vault.py --fast                         # 产物终验（需生产库+产物）
 python scripts/batch_vision.py --all --workers 24 --rounds 8  # 批量视觉（须配 DL_LLM_TIMEOUT=240）
 python scripts/batch_vision.py --all --blind --workers 24     # 重做"没送图就写了总结"的历史片
 python scripts/rebuild_daily.py --workers 4                   # 重生成日报（753 天约 9 分钟）
